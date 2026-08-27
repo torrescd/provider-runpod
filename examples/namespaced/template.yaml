@@ -1,0 +1,15 @@
+apiVersion: serverless.runpod.crossplane.io/v1alpha1
+kind: Template
+metadata:
+  name: opencode-model
+  namespace: runpod-system
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: restricted-management
+  forProvider:
+    name: xp-opencode-model
+    imageName: ghcr.io/example/model@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    containerDiskInGb: 50
+    ports:
+      - 8000/http

@@ -1,0 +1,24 @@
+apiVersion: serverless.runpod.crossplane.io/v1alpha1
+kind: Endpoint
+metadata:
+  name: opencode-model
+  namespace: runpod-system
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: restricted-management
+  forProvider:
+    maxLifetimeSeconds: 14400
+    deleteReferencedTemplateOnExpiry: true
+    name: xp-opencode-experiment
+    templateIdRef:
+      name: opencode-model
+    gpuTypeIds:
+      - NVIDIA L4
+    dataCenterIds:
+      - EU-RO-1
+    workersMax: 1
+    idleTimeout: 5
+    scalerType: QUEUE_DELAY
+    scalerValue: 4
+    executionTimeoutMs: 600000

@@ -1,7 +1,7 @@
 # ====================================================================================
 # Setup Project
-PROJECT_NAME := provider-template
-PROJECT_REPO := github.com/crossplane/$(PROJECT_NAME)
+PROJECT_NAME := provider-runpod
+PROJECT_REPO := github.com/torrescd/$(PROJECT_NAME)
 
 PLATFORMS ?= linux_amd64 linux_arm64
 -include build/makelib/common.mk
@@ -16,7 +16,7 @@ PLATFORMS ?= linux_amd64 linux_arm64
 
 NPROCS ?= 1
 GO_TEST_PARALLEL := $(shell echo $$(( $(NPROCS) / 2 )))
-GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider
+GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider $(GO_PROJECT)/cmd/model-router
 GO_LDFLAGS += -X $(GO_PROJECT)/internal/version.Version=$(VERSION)
 GO_SUBDIRS += cmd internal apis
 GO111MODULE = on
@@ -31,7 +31,7 @@ GOLANGCILINT_VERSION = 2.12.2
 # ====================================================================================
 # Setup Images
 
-IMAGES = provider-template
+IMAGES = provider-runpod model-router
 -include build/makelib/imagelight.mk
 
 # ====================================================================================
@@ -41,12 +41,12 @@ XPKG_REG_ORGS ?= xpkg.upbound.io/crossplane
 # NOTE(hasheddan): skip promoting on xpkg.upbound.io as channel tags are
 # inferred.
 XPKG_REG_ORGS_NO_PROMOTE ?= xpkg.upbound.io/crossplane
-XPKGS = provider-template
+XPKGS = provider-runpod
 -include build/makelib/xpkg.mk
 
 # NOTE(hasheddan): we force image building to happen prior to xpkg build so that
 # we ensure image is present in daemon.
-xpkg.build.provider-template: do.build.images
+xpkg.build.provider-runpod: do.build.images
 
 fallthrough: submodules
 	@echo Initial setup complete. Running make again . . .
@@ -95,9 +95,9 @@ dev: $(KIND) $(KUBECTL)
 	@$(INFO) Creating kind cluster
 	@$(KIND) create cluster --name=$(PROJECT_NAME)-dev
 	@$(KUBECTL) cluster-info --context kind-$(PROJECT_NAME)-dev
-	@$(INFO) Installing Provider Template CRDs
+	@$(INFO) Installing Provider RunPod CRDs
 	@$(KUBECTL) apply -R -f package/crds
-	@$(INFO) Starting Provider Template controllers
+	@$(INFO) Starting Provider RunPod controllers
 	@$(GO) run cmd/provider/main.go --debug
 
 dev-clean: $(KIND) $(KUBECTL)
@@ -122,7 +122,7 @@ $(GOMPLATE):
 
 export GOMPLATE
 
-# This target prepares repo for your provider by replacing all "template"
+# This target prepares repo for your provider by replacing all "runpod"
 # occurrences with your provider name.
 # This target can only be run once, if you want to rerun for some reason,
 # consider stashing/resetting your git state.

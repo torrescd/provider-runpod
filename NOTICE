@@ -1,0 +1,10 @@
+provider-runpod
+Copyright 2026 The provider-runpod Authors
+
+This product includes software developed by the Crossplane Authors under the
+Apache License 2.0. The repository was initialized from crossplane/provider-template
+at commit 8bb059faca2a9b6340aec0285265e493107df603.
+
+RunPod is a trademark of its respective owner. This project is an independent
+clean-room implementation based on public RunPod API documentation and is not
+an official RunPod product.

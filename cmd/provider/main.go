@@ -48,14 +48,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 
-	"github.com/crossplane/provider-template/apis"
-	template "github.com/crossplane/provider-template/internal/controller"
-	"github.com/crossplane/provider-template/internal/version"
+	"github.com/torrescd/provider-runpod/apis"
+	runpod "github.com/torrescd/provider-runpod/internal/controller"
+	"github.com/torrescd/provider-runpod/internal/version"
 )
 
 func main() {
 	var (
-		app            = kingpin.New(filepath.Base(os.Args[0]), "Template support for Crossplane.").DefaultEnvars()
+		app            = kingpin.New(filepath.Base(os.Args[0]), "RunPod support for Crossplane.").DefaultEnvars()
 		debug          = app.Flag("debug", "Run with debug logging.").Short('d').Bool()
 		leaderElection = app.Flag("leader-election", "Use leader election for the controller manager.").Short('l').Default("false").Envar("LEADER_ELECTION").Bool()
 
@@ -74,7 +74,7 @@ func main() {
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
 	zl := zap.New(zap.UseDevMode(*debug))
-	log := logging.NewLogrLogger(zl.WithName("provider-template"))
+	log := logging.NewLogrLogger(zl.WithName("provider-runpod"))
 	if *debug {
 		// The controller-runtime is *very* verbose even at info level, so we only
 		// provide it a real logger when we're running in debug mode.
@@ -104,7 +104,7 @@ func main() {
 
 	scheme := runtime.NewScheme()
 	kingpin.FatalIfError(clientgoscheme.AddToScheme(scheme), "Cannot add clientgo scheme")
-	kingpin.FatalIfError(apis.AddToScheme(scheme), "Cannot add Template APIs to scheme")
+	kingpin.FatalIfError(apis.AddToScheme(scheme), "Cannot add RunPod APIs to scheme")
 	kingpin.FatalIfError(apiextensionsv1.AddToScheme(scheme), "Cannot add CustomResourceDefinition to scheme")
 
 	mgr, err := ctrl.NewManager(ratelimiter.LimitRESTConfig(cfg, *maxReconcileRate), ctrl.Options{
@@ -130,7 +130,7 @@ func main() {
 		// server. Switching to Leases only and longer leases appears to
 		// alleviate this.
 		LeaderElection:             *leaderElection,
-		LeaderElectionID:           "crossplane-leader-election-provider-template",
+		LeaderElectionID:           "crossplane-leader-election-provider-runpod",
 		LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
 		LeaseDuration:              func() *time.Duration { d := 60 * time.Second; return &d }(),
 		RenewDeadline:              func() *time.Duration { d := 50 * time.Second; return &d }(),
@@ -172,12 +172,12 @@ func main() {
 		clo := controller.ChangeLogOptions{
 			ChangeLogger: managed.NewGRPCChangeLogger(
 				changelogsv1alpha1.NewChangeLogServiceClient(conn),
-				managed.WithProviderVersion(fmt.Sprintf("provider-template:%s", version.Version))),
+				managed.WithProviderVersion(fmt.Sprintf("provider-runpod:%s", version.Version))),
 		}
 		o.ChangeLogOptions = &clo
 	}
 
 	kingpin.FatalIfError(customresourcesgate.Setup(mgr, o), "Cannot setup CRD gate controller")
-	kingpin.FatalIfError(template.SetupGated(mgr, o), "Cannot setup Template controllers")
+	kingpin.FatalIfError(runpod.SetupGated(mgr, o), "Cannot setup RunPod controllers")
 	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
 }

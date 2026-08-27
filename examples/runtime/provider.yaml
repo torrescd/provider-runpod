@@ -1,0 +1,9 @@
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-runpod
+spec:
+  # Replace the tag with the release digest from release-digests.txt.
+  package: ghcr.io/torrescd/provider-runpod:v0.1.0
+  runtimeConfigRef:
+    name: provider-runpod-hardened

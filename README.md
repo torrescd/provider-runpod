@@ -1,39 +1,53 @@
-# provider-template
+# provider-runpod
 
-`provider-template` is a minimal [Crossplane](https://crossplane.io/) Provider
-that is meant to be used as a template for implementing new Providers. It comes
-with the following features that are meant to be refactored:
+`provider-runpod` is a clean-room, Apache-2.0 Crossplane v2 provider for the
+official RunPod REST API. It currently manages private, digest-pinned Serverless
+`Template` and cost-bounded `Endpoint` resources. `EndpointCheck` admits exactly
+one endpoint to the optional model router only after authenticated health,
+model identity, and tool-call checks pass.
 
-- A `ProviderConfig` type that only points to a credentials `Secret`.
-- A `MyType` resource type that serves as an example managed resource.
-- A managed resource controller that reconciles `MyType` objects and simply
-  prints their configuration in its `Observe` method.
+This repository was initialized from `crossplane/provider-template` commit
+`8bb059faca2a9b6340aec0285265e493107df603`. No RunPod Terraform provider
+source, schema, generated code, or fixtures are used.
 
-## Developing
+## Supported resources
 
-1. Use this repository as a template to create a new one.
-1. Run `make submodules` to initialize the "build" Make submodule we use for CI/CD.
-1. Rename the provider by running the following command:
-```shell
-  export provider_name=MyProvider # Camel case, e.g. GitHub
-  make provider.prepare provider=${provider_name}
+| API | Purpose |
+|---|---|
+| `Template.serverless.runpod.crossplane.io/v1alpha1` | Private Serverless template using an OCI digest |
+| `Endpoint.serverless.runpod.crossplane.io/v1alpha1` | GPU endpoint with `workersMin=0`, `workersMax<=1`, and hard TTL |
+| `EndpointCheck.verification.runpod.crossplane.io/v1alpha1` | Inference-only readiness and routing gate |
+
+Pods and network volumes are deliberately deferred. Imperative actions,
+inference jobs, workers, billing, logs, and Terraform-style data sources are not
+implemented.
+
+## Security model
+
+- The production management URL is fixed at `https://rest.runpod.io/v1`.
+- The production inference URL is fixed at `https://api.runpod.ai`.
+- Both clients honor `HTTP_PROXY`/`HTTPS_PROXY`; only loopback URLs may be
+  substituted in tests.
+- A namespaced ProviderConfig can only use a management Secret in its namespace.
+- EndpointCheck uses a distinct local, endpoint-scoped inference Secret and
+  rejects a Secret referenced by any ProviderConfig.
+- model-router has no ProviderConfig RBAC and never holds the management key.
+- Template images must be `repository@sha256:<64 lowercase hex>` and should also
+  be verified by admission policy before resource creation.
+- Endpoint and route lifetimes are hard-bounded to 24 hours.
+
+See [security](docs/security.md), [API sources](docs/api-sources.md), the
+[Terraform migration guide](docs/terraform-migration.md), and the
+[operations runbook](docs/runbooks.md).
+
+## Development
+
+```sh
+git submodule update --init --recursive
+make reviewable
+make build
 ```
-4. Add your new type by running the following command:
-```shell
-  export group=sample # lower case e.g. core, cache, database, storage, etc.
-  export type=MyType # Camel casee.g. Bucket, Database, CacheCluster, etc.
-  make provider.addtype provider=${provider_name} group=${group} kind=${type}
-```
-5. Replace the *sample* group with your new group in apis/{provider}.go
-5. Replace the *mytype* type with your new type in internal/controller/{provider}.go
-5. Replace the default controller and ProviderConfig implementations with your own
-5. Register your new type into `SetupGated` function in `internal/controller/register.go`
-5. Run `make reviewable` to run code generation, linters, and tests.
-5. Run `make build` to build the provider.
 
-Refer to Crossplane's [CONTRIBUTING.md] file for more information on how the
-Crossplane community prefers to work. The [Provider Development][provider-dev]
-guide may also be of use.
-
-[CONTRIBUTING.md]: https://github.com/crossplane/crossplane/blob/master/CONTRIBUTING.md
-[provider-dev]: https://github.com/crossplane/crossplane/blob/master/contributing/guide-provider-development.md
+Unit and fake-controller tests never call RunPod. Live acceptance is manual,
+uses a newly created restricted key, and is intentionally absent from ordinary
+pull request CI.

@@ -1,0 +1,15 @@
+apiVersion: verification.runpod.crossplane.io/v1alpha1
+kind: EndpointCheck
+metadata:
+  name: opencode-model
+  namespace: runpod-system
+spec:
+  forProvider:
+    maxLifetimeSeconds: 14400
+    endpointIdRef:
+      name: opencode-model
+    expectedModelId: org/model-name
+    timeoutSeconds: 15
+    inferenceCredentialsSecretRef:
+      name: runpod-inference
+      key: apiKey

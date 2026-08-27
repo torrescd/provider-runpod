@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+  security-events: write
+
+env:
+  GO_VERSION: 1.25.11
+  CROSSPLANE_CLI_VERSION: v1.20.0
+  REGISTRY: ghcr.io
+  CONTROLLER_IMAGE: ghcr.io/torrescd/provider-runpod-controller
+  ROUTER_IMAGE: ghcr.io/torrescd/provider-runpod-model-router
+  PACKAGE_IMAGE: ghcr.io/torrescd/provider-runpod
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Validate immutable semver source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-list -n1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain)"
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Test and build both architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+          for arch in amd64 arm64; do
+            mkdir -p "bin/linux_${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w -X github.com/torrescd/provider-runpod/internal/version.Version=${GITHUB_REF_NAME}" -o "bin/linux_${arch}/provider" ./cmd/provider
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w" -o "bin/linux_${arch}/model-router" ./cmd/model-router
+          done
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push controller
+        id: controller
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: cluster/images/provider-runpod/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.CONTROLLER_IMAGE }}:${{ github.ref_name }}
+            ${{ env.CONTROLLER_IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: Build and push model-router
+        id: router
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: cluster/images/model-router/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.ROUTER_IMAGE }}:${{ github.ref_name }}
+            ${{ env.ROUTER_IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: Scan controller before signing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          image-ref: ${{ env.CONTROLLER_IMAGE }}@${{ steps.controller.outputs.digest }}
+          format: sarif
+          output: trivy-controller.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan model-router before signing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          image-ref: ${{ env.ROUTER_IMAGE }}@${{ steps.router.outputs.digest }}
+          format: sarif
+          output: trivy-router.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Generate controller SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.CONTROLLER_IMAGE }}@${{ steps.controller.outputs.digest }}
+          format: spdx-json
+          output-file: sbom-controller.spdx.json
+          artifact-name: sbom-controller.spdx.json
+      - name: Generate model-router SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.ROUTER_IMAGE }}@${{ steps.router.outputs.digest }}
+          format: spdx-json
+          output-file: sbom-model-router.spdx.json
+          artifact-name: sbom-model-router.spdx.json
+      - name: Install pinned Crossplane CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --output /usr/local/bin/crossplane "https://releases.crossplane.io/stable/${CROSSPLANE_CLI_VERSION}/bin/linux_amd64/crank?source=provider-runpod-release"
+          chmod 0755 /usr/local/bin/crossplane
+          crossplane version --client
+      - name: Build and push Crossplane package
+        id: package
+        shell: bash
+        env:
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+        run: |
+          set -euo pipefail
+          crossplane xpkg build --package-root package --examples-root examples --embed-runtime-image "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" --package-file "provider-runpod-${GITHUB_REF_NAME}.xpkg"
+          crossplane xpkg push --package-files "provider-runpod-${GITHUB_REF_NAME}.xpkg" "${PACKAGE_IMAGE}:${GITHUB_REF_NAME}"
+          PACKAGE_DIGEST="$(docker buildx imagetools inspect "${PACKAGE_IMAGE}:${GITHUB_REF_NAME}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test -n "${PACKAGE_DIGEST}"
+          echo "digest=${PACKAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
+      - name: Generate package SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: ./package
+          format: spdx-json
+          output-file: sbom-provider-package.spdx.json
+          artifact-name: sbom-provider-package.spdx.json
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v3.0.5
+      - name: Keyless sign all immutable artifacts
+        shell: bash
+        env:
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}"
+          cosign sign --yes "${ROUTER_IMAGE}@${ROUTER_DIGEST}"
+          cosign sign --yes "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"
+      - name: Attest controller SLSA provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.CONTROLLER_IMAGE }}
+          subject-digest: ${{ steps.controller.outputs.digest }}
+          push-to-registry: true
+      - name: Attest router SLSA provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.ROUTER_IMAGE }}
+          subject-digest: ${{ steps.router.outputs.digest }}
+          push-to-registry: true
+      - name: Attest package SLSA provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.PACKAGE_IMAGE }}
+          subject-digest: ${{ steps.package.outputs.digest }}
+          push-to-registry: true
+      - name: Attest controller SPDX SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.CONTROLLER_IMAGE }}
+          subject-digest: ${{ steps.controller.outputs.digest }}
+          sbom-path: sbom-controller.spdx.json
+          push-to-registry: true
+      - name: Attest router SPDX SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.ROUTER_IMAGE }}
+          subject-digest: ${{ steps.router.outputs.digest }}
+          sbom-path: sbom-model-router.spdx.json
+          push-to-registry: true
+      - name: Attest package SPDX SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.PACKAGE_IMAGE }}
+          subject-digest: ${{ steps.package.outputs.digest }}
+          sbom-path: sbom-provider-package.spdx.json
+          push-to-registry: true
+      - name: Make GHCR packages public and verify anonymous pulls
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for package in provider-runpod provider-runpod-controller provider-runpod-model-router; do
+            gh api --method PATCH "/user/packages/container/${package}/visibility" -f visibility=public
+          done
+          docker logout ghcr.io
+          docker buildx imagetools inspect "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" >/dev/null
+          docker buildx imagetools inspect "${ROUTER_IMAGE}@${ROUTER_DIGEST}" >/dev/null
+          docker buildx imagetools inspect "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}" >/dev/null
+      - name: Publish digest manifest and GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cat > release-digests.txt <<EOF
+          ${PACKAGE_IMAGE}@${PACKAGE_DIGEST}
+          ${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}
+          ${ROUTER_IMAGE}@${ROUTER_DIGEST}
+          keyless-identity=https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@refs/tags/${GITHUB_REF_NAME}
+          issuer=https://token.actions.githubusercontent.com
+          EOF
+          sha256sum "provider-runpod-${GITHUB_REF_NAME}.xpkg" sbom-*.spdx.json > SHA256SUMS
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes \
+            "provider-runpod-${GITHUB_REF_NAME}.xpkg" release-digests.txt SHA256SUMS sbom-*.spdx.json

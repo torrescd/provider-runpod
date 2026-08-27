@@ -34,7 +34,7 @@ echo_error(){
 
 
 # The name of your provider. Many provider Makefiles override this value.
-PACKAGE_NAME="provider-template"
+PACKAGE_NAME="provider-runpod"
 
 
 # ------------------------------
@@ -136,10 +136,10 @@ EOF
 )"
 echo "${PVC_YAML}" | "${KUBECTL}" create -f -
 
-# install crossplane from stable channel
-echo_step "installing crossplane from stable channel"
+# install the pinned Crossplane version
+echo_step "installing pinned Crossplane"
 "${HELM3}" repo add crossplane-stable https://charts.crossplane.io/stable/
-chart_version="$("${HELM3}" search repo crossplane-stable/crossplane | awk 'FNR == 2 {print $2}')"
+chart_version="2.4.0"
 echo_info "using crossplane version ${chart_version}"
 echo
 # we replace empty dir with our PVC so that the /cache dir in the kind node
