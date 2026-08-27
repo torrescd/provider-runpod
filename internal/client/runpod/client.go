@@ -162,6 +162,9 @@ func (c *Client) CreateTemplate(ctx context.Context, in TemplateInput) (*Templat
 	if err := c.doJSON(ctx, http.MethodPost, "/templates", in, &out); err != nil {
 		return nil, err
 	}
+	if out.ID == "" {
+		return nil, ErrCreateAmbiguous
+	}
 	return &out, nil
 }
 
@@ -171,6 +174,9 @@ func (c *Client) UpdateTemplate(ctx context.Context, id string, in TemplateInput
 	var out Template
 	if err := c.doJSON(ctx, http.MethodPatch, "/templates/"+safeID(id), in, &out); err != nil {
 		return nil, err
+	}
+	if out.ID == "" {
+		return c.GetTemplate(ctx, id)
 	}
 	return &out, nil
 }
@@ -221,6 +227,9 @@ func (c *Client) CreateEndpoint(ctx context.Context, in EndpointInput) (*Endpoin
 	if err := c.doJSON(ctx, http.MethodPost, "/endpoints", in, &out); err != nil {
 		return nil, err
 	}
+	if out.ID == "" {
+		return nil, ErrCreateAmbiguous
+	}
 	return &out, nil
 }
 
@@ -228,6 +237,9 @@ func (c *Client) UpdateEndpoint(ctx context.Context, id string, in EndpointInput
 	var out Endpoint
 	if err := c.doJSON(ctx, http.MethodPatch, "/endpoints/"+safeID(id), in, &out); err != nil {
 		return nil, err
+	}
+	if out.ID == "" {
+		return c.GetEndpoint(ctx, id)
 	}
 	return &out, nil
 }
@@ -300,6 +312,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, input, output 
 			return ErrNotFound
 		}
 		if retryable(resp.StatusCode) && attempt < maxAttempts-1 {
+			// POST may have committed even when the service returned an error.
+			// Never repeat a potentially chargeable create; the controller uses
+			// an exact, provider-owned name to recover the result instead.
+			if method == http.MethodPost {
+				return fmt.Errorf("%w: %w", ErrCreateAmbiguous, &APIError{StatusCode: resp.StatusCode, RequestID: requestID(resp.Header)})
+			}
 			if err := c.sleep(ctx, backoff(attempt, resp.Header.Get("Retry-After"))); err != nil {
 				return err
 			}

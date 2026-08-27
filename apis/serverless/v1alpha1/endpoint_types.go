@@ -19,6 +19,7 @@ var (
 
 // EndpointParameters are the bounded RunPod Serverless endpoint fields.
 // API source: https://docs.runpod.io/api-reference/endpoints/POST/endpoints
+// +kubebuilder:validation:XValidation:rule="has(self.templateId) != has(self.templateIdRef)",message="exactly one of templateId or templateIdRef is required"
 type EndpointParameters struct {
 	// MaxLifetimeSeconds is the hard lifetime of this experiment endpoint.
 	// The provider janitor removes EndpointChecks first, then deletes this CR.
@@ -40,6 +41,7 @@ type EndpointParameters struct {
 	Name string `json:"name"`
 
 	// TemplateID is the external RunPod template ID. Prefer TemplateIDRef.
+	// +kubebuilder:validation:MinLength=1
 	// +optional
 	TemplateID string `json:"templateId,omitempty"`
 

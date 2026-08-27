@@ -108,7 +108,8 @@ func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return r.fail(ctx, check, result, err)
 	}
-	check.Status.AtProvider = observation(endpointID, result)
+	check.Status.AtProvider = observation(endpointID, result, secret.ResourceVersion)
+	check.Status.ObservedGeneration = check.Generation
 	check.Status.SetConditions(xpv2.Available(), xpv2.ReconcileSuccess())
 	if err := r.kube.Status().Update(ctx, check); err != nil {
 		return ctrl.Result{}, err
@@ -166,7 +167,8 @@ func (r *reconciler) rejectManagementSecret(ctx context.Context, namespace, name
 }
 
 func (r *reconciler) fail(ctx context.Context, check *verificationv1alpha1.EndpointCheck, result inference.Result, cause error) (ctrl.Result, error) {
-	check.Status.AtProvider = observation(check.Spec.ForProvider.EndpointID, result)
+	check.Status.AtProvider = observation(check.Spec.ForProvider.EndpointID, result, "")
+	check.Status.ObservedGeneration = check.Generation
 	check.Status.SetConditions(xpv2.Unavailable().WithMessage(safeMessage(cause)), xpv2.ReconcileError(cause))
 	if err := r.kube.Status().Update(ctx, check); err != nil {
 		return ctrl.Result{}, err
@@ -186,7 +188,7 @@ func nextPoll(expiresAt time.Time) time.Duration {
 	return pollInterval
 }
 
-func observation(endpointID string, result inference.Result) verificationv1alpha1.EndpointCheckObservation {
+func observation(endpointID string, result inference.Result, secretResourceVersion string) verificationv1alpha1.EndpointCheckObservation {
 	url := ""
 	if endpointID != "" {
 		url = "https://api.runpod.ai/v2/" + endpointID + "/openai/v1"
@@ -194,7 +196,7 @@ func observation(endpointID string, result inference.Result) verificationv1alpha
 	return verificationv1alpha1.EndpointCheckObservation{
 		EndpointID: endpointID, Healthy: result.Healthy, ModelVerified: result.ModelVerified,
 		ToolCallVerified: result.ToolCallVerified, InferenceURL: url,
-		LastCheckedAt: metav1.Now(),
+		CredentialsSecretResourceVersion: secretResourceVersion, LastCheckedAt: metav1.Now(),
 	}
 }
 

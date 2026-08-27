@@ -33,6 +33,7 @@ const (
 	LogicalModelID       = "runpod-experiment"
 	RouterDrainFinalizer = "router.runpod.crossplane.io/drain"
 	maxRequestBytes      = 2 << 20
+	maxVerificationAge   = 90 * time.Second
 )
 
 var secretPattern = regexp.MustCompile(`(?i)rpa_[a-z0-9_-]{8,}`)
@@ -113,7 +114,10 @@ func (r *Router) Refresh(ctx context.Context) error {
 		expiresAt := check.CreationTimestamp.Add(time.Duration(check.Spec.ForProvider.MaxLifetimeSeconds) * time.Second)
 		ready := check.Status.GetCondition(xpv2.TypeReady).Status == corev1.ConditionTrue
 		observed := check.Status.AtProvider
-		if ready && now.Before(expiresAt) && observed.Healthy && observed.ModelVerified &&
+		fresh := check.Status.ObservedGeneration == check.Generation &&
+			!observed.LastCheckedAt.IsZero() && !observed.LastCheckedAt.After(now.Add(30*time.Second)) &&
+			now.Sub(observed.LastCheckedAt.Time) <= maxVerificationAge
+		if ready && fresh && now.Before(expiresAt) && observed.Healthy && observed.ModelVerified &&
 			observed.ToolCallVerified && observed.EndpointID != "" {
 			eligible = append(eligible, check)
 		}
@@ -130,6 +134,11 @@ func (r *Router) Refresh(ctx context.Context) error {
 		secret := &corev1.Secret{}
 		if err := r.kube.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ref.Name}, secret); err != nil {
 			stateErr = "cannot read inference credential"
+			break
+		}
+		if check.Status.AtProvider.CredentialsSecretResourceVersion == "" ||
+			secret.ResourceVersion != check.Status.AtProvider.CredentialsSecretResourceVersion {
+			stateErr = "inference credential changed since verification"
 			break
 		}
 		token := secret.Data[ref.Key]

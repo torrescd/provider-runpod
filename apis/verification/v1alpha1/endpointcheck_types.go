@@ -18,6 +18,7 @@ var (
 )
 
 // EndpointCheckParameters define an authenticated, inference-only readiness gate.
+// +kubebuilder:validation:XValidation:rule="has(self.endpointId) != has(self.endpointIdRef)",message="exactly one of endpointId or endpointIdRef is required"
 type EndpointCheckParameters struct {
 	// MaxLifetimeSeconds is the hard lifetime of the admitted route. The check
 	// controller self-deletes the CR at expiry, causing model-router to fail closed.
@@ -27,6 +28,7 @@ type EndpointCheckParameters struct {
 	MaxLifetimeSeconds int32 `json:"maxLifetimeSeconds"`
 
 	// EndpointID is the external RunPod endpoint ID. Prefer EndpointIDRef.
+	// +kubebuilder:validation:MinLength=1
 	// +optional
 	EndpointID string `json:"endpointId,omitempty"`
 
@@ -51,12 +53,16 @@ type EndpointCheckParameters struct {
 }
 
 type EndpointCheckObservation struct {
-	EndpointID       string      `json:"endpointId,omitempty"`
-	Healthy          bool        `json:"healthy,omitempty"`
-	ModelVerified    bool        `json:"modelVerified,omitempty"`
-	ToolCallVerified bool        `json:"toolCallVerified,omitempty"`
-	InferenceURL     string      `json:"inferenceUrl,omitempty"`
-	LastCheckedAt    metav1.Time `json:"lastCheckedAt,omitempty"`
+	EndpointID       string `json:"endpointId,omitempty"`
+	Healthy          bool   `json:"healthy,omitempty"`
+	ModelVerified    bool   `json:"modelVerified,omitempty"`
+	ToolCallVerified bool   `json:"toolCallVerified,omitempty"`
+	InferenceURL     string `json:"inferenceUrl,omitempty"`
+	// CredentialsSecretResourceVersion binds admission to the exact Secret
+	// version used by the authenticated checks. It is metadata, never secret
+	// material. A credential rotation withdraws routing until it is reverified.
+	CredentialsSecretResourceVersion string      `json:"credentialsSecretResourceVersion,omitempty"`
+	LastCheckedAt                    metav1.Time `json:"lastCheckedAt,omitempty"`
 }
 
 type EndpointCheckSpec struct {

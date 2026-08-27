@@ -13,6 +13,11 @@ This single-node platform permits at most one admitted route. If two checks are
 Ready, the router returns 503 until the collision is resolved. It never chooses
 a winner nondeterministically.
 
+Ready status is accepted only for the current EndpointCheck generation, the
+exact inference Secret version that was probed, and for 90 seconds after the
+last successful health/model/tool verification. Credential rotation and stale
+controller status fail closed.
+
 Streaming chat responses are passed through. model-router does not rewrite the
 upstream response model field; clients must treat the configured logical model
 ID as authoritative.

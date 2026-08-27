@@ -54,8 +54,11 @@ bounds, inference URL without credentials, and observation timestamp.
 Before external deletion the client PATCHes both worker bounds to zero, then
 DELETEs and observes until 404. Deletion is refused while a matching
 EndpointCheck exists. At hard TTL, the janitor marks checks for deletion, waits
-for model-router to acknowledge route withdrawal, then deletes the Endpoint CR
-idempotently and optionally its referenced Template CR.
+for model-router to acknowledge route withdrawal, then marks the Endpoint CR
+for deletion. Its sequencing finalizer waits until Crossplane has confirmed the
+external Endpoint is gone before deleting an unshared referenced Template CR.
+These operations are idempotent; a failed route drain or external delete leaves
+the CR terminating for a later retry instead of deleting out of order.
 
 ## Management policies
 

@@ -110,6 +110,23 @@ func TestExpiredCheckAndProxyTransportFailClosed(t *testing.T) {
 	}
 }
 
+func TestStaleVerificationAndCredentialRotationFailClosed(t *testing.T) {
+	check := readyCheck("stale-generation")
+	check.Generation = 2
+	check.Status.ObservedGeneration = 1
+	r := readyRouter(t, "http://127.0.0.1:1", check)
+	if err := r.Refresh(context.Background()); err == nil || r.snapshot() != nil {
+		t.Fatal("status from a prior generation was routed")
+	}
+
+	check = readyCheck("rotated-secret")
+	check.Status.AtProvider.CredentialsSecretResourceVersion = "old"
+	r = readyRouter(t, "http://127.0.0.1:1", check)
+	if err := r.Refresh(context.Background()); err == nil || r.snapshot() != nil {
+		t.Fatal("credential version not used by readiness checks was routed")
+	}
+}
+
 func readyRouter(t *testing.T, upstream string, checks ...*verificationv1alpha1.EndpointCheck) *Router {
 	t.Helper()
 	scheme := testScheme(t)
@@ -135,14 +152,16 @@ func readyCheck(name string) *verificationv1alpha1.EndpointCheck {
 		}},
 		Status: verificationv1alpha1.EndpointCheckStatus{AtProvider: verificationv1alpha1.EndpointCheckObservation{
 			EndpointID: "endpoint_1", Healthy: true, ModelVerified: true, ToolCallVerified: true,
+			CredentialsSecretResourceVersion: "1", LastCheckedAt: metav1.Now(),
 		}},
 	}
+	check.Status.ObservedGeneration = check.Generation
 	check.Status.SetConditions(xpv2.Available(), xpv2.ReconcileSuccess())
 	return check
 }
 
 func inferenceSecret() *corev1.Secret {
-	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "inference", Namespace: "runpod-system"}, Data: map[string][]byte{"token": []byte("endpoint-token")}}
+	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "inference", Namespace: "runpod-system", ResourceVersion: "1"}, Data: map[string][]byte{"token": []byte("endpoint-token")}}
 }
 
 func testScheme(t *testing.T) *runtime.Scheme {

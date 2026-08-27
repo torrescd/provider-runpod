@@ -68,6 +68,24 @@ func TestCreateTransportFailureIsNotRetried(t *testing.T) {
 	}
 }
 
+func TestCreateHTTPFailureIsNotRetried(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("X-Request-ID", "safe-request-id")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	c, err := New([]byte("safe-key"), WithBaseURLForTesting(server.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.CreateTemplate(context.Background(), TemplateInput{Name: "unique"})
+	if !errors.Is(err, ErrCreateAmbiguous) || calls != 1 || !strings.Contains(err.Error(), "safe-request-id") {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
 func TestRetries429AndEndpointDeleteScalesToZero(t *testing.T) {
 	calls := 0
 	var methods []string

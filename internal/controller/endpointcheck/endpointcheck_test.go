@@ -49,7 +49,7 @@ func TestReconcilePublishesReadyOnlyAfterAllChecks(t *testing.T) {
 	if err := kube.Get(context.Background(), request(check).NamespacedName, got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue || !got.Status.AtProvider.ToolCallVerified || got.Status.AtProvider.EndpointID != "endpoint_1" {
+	if got.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue || !got.Status.AtProvider.ToolCallVerified || got.Status.AtProvider.EndpointID != "endpoint_1" || got.Status.ObservedGeneration != got.Generation || got.Status.AtProvider.CredentialsSecretResourceVersion == "" {
 		t.Fatalf("unexpected status: %+v", got.Status)
 	}
 }

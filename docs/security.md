@@ -20,6 +20,12 @@ Secret, or a Kubernetes API error withdraws the route. A router-owned finalizer
 acknowledges that the route has been withdrawn before an EndpointCheck can
 disappear. Endpoint deletion is blocked while a matching check exists.
 
+Admission is bound to the EndpointCheck's current Kubernetes generation and to
+the exact inference Secret `resourceVersion` used by the authenticated probes.
+A spec edit or credential rotation therefore withdraws the route until all
+checks pass again. Verification status older than 90 seconds is rejected, so a
+stopped check controller cannot leave an indefinitely stale route active.
+
 Inbound Authorization and API-key headers, query parameters, RunPod-key-shaped
 values, and JSON fields named like credentials are rejected. Bodies are never
 logged and errors contain neither response bodies nor keys.
@@ -36,6 +42,13 @@ and allow only their respective CONNECT proxies:
 
 The production base URLs are compiled in. Only a loopback override exists for
 tests.
+
+The lifetime janitor holds its own Endpoint finalizer. It deletes matching
+EndpointChecks and waits for router drain acknowledgement, initiates Endpoint
+deletion, waits for Crossplane's external-resource finalizer to disappear, and
+only then deletes an unshared referenced Template. Manual Endpoint deletion is
+also route-drained. If router acknowledgement or external deletion fails, the
+objects remain terminating instead of being leaked or deleted out of order.
 
 ## Image policy
 

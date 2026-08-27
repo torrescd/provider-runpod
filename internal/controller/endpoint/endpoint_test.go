@@ -81,6 +81,7 @@ func TestResolveTemplateReferenceRequiresExternalID(t *testing.T) {
 	_ = serverlessv1alpha1.SchemeBuilder.AddToScheme(scheme)
 	template := &serverlessv1alpha1.Template{ObjectMeta: metav1.ObjectMeta{Name: "template", Namespace: "runpod-system"}}
 	meta.SetExternalName(template, "tpl_1")
+	template.Status.SetConditions(xpv2.Available())
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(template).Build()
 	cr := endpointCR()
 	cr.Spec.ForProvider.TemplateID = ""
@@ -88,6 +89,20 @@ func TestResolveTemplateReferenceRequiresExternalID(t *testing.T) {
 	id, err := resolveTemplateID(context.Background(), kube, cr)
 	if err != nil || id != "tpl_1" {
 		t.Fatalf("id=%q err=%v", id, err)
+	}
+}
+
+func TestResolveTemplateReferenceRequiresReadyTemplate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = serverlessv1alpha1.SchemeBuilder.AddToScheme(scheme)
+	template := &serverlessv1alpha1.Template{ObjectMeta: metav1.ObjectMeta{Name: "template", Namespace: "runpod-system"}}
+	meta.SetExternalName(template, "tpl_1")
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(template).Build()
+	cr := endpointCR()
+	cr.Spec.ForProvider.TemplateID = ""
+	cr.Spec.ForProvider.TemplateIDRef = &xpv2.Reference{Name: template.Name}
+	if _, err := resolveTemplateID(context.Background(), kube, cr); err == nil {
+		t.Fatal("unverified Template was accepted")
 	}
 }
 

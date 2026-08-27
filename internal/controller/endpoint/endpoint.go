@@ -20,6 +20,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -195,6 +196,9 @@ func resolveTemplateID(ctx context.Context, kube client.Client, cr *serverlessv1
 	t := &serverlessv1alpha1.Template{}
 	if err := kube.Get(ctx, types.NamespacedName{Name: p.TemplateIDRef.Name, Namespace: cr.Namespace}, t); err != nil {
 		return "", err
+	}
+	if !t.DeletionTimestamp.IsZero() || t.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue {
+		return "", errors.New("referenced Template is not Ready")
 	}
 	id := meta.GetExternalName(t)
 	if id == "" {
