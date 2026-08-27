@@ -133,6 +133,7 @@ spec:
                   templateId:
                     description: TemplateID is the external RunPod template ID. Prefer
                       TemplateIDRef.
+                    minLength: 1
                     type: string
                   templateIdRef:
                     description: TemplateIDRef references a Template in this namespace.
@@ -185,6 +186,9 @@ spec:
                 - scalerValue
                 - workersMax
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of templateId or templateIdRef is required
+                  rule: has(self.templateId) != has(self.templateIdRef)
               managementPolicies:
                 default:
                 - '*'

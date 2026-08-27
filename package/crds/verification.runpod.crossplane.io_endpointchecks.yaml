@@ -61,6 +61,7 @@ spec:
                   endpointId:
                     description: EndpointID is the external RunPod endpoint ID. Prefer
                       EndpointIDRef.
+                    minLength: 1
                     type: string
                   endpointIdRef:
                     description: EndpointIDRef references an Endpoint in this namespace.
@@ -139,6 +140,9 @@ spec:
                 - inferenceCredentialsSecretRef
                 - maxLifetimeSeconds
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of endpointId or endpointIdRef is required
+                  rule: has(self.endpointId) != has(self.endpointIdRef)
               managementPolicies:
                 default:
                 - '*'
@@ -201,6 +205,12 @@ spec:
             properties:
               atProvider:
                 properties:
+                  credentialsSecretResourceVersion:
+                    description: |-
+                      CredentialsSecretResourceVersion binds admission to the exact Secret
+                      version used by the authenticated checks. It is metadata, never secret
+                      material. A credential rotation withdraws routing until it is reverified.
+                    type: string
                   endpointId:
                     type: string
                   healthy:
