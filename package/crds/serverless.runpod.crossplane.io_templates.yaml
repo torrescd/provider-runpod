@@ -4,18 +4,18 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.0
-  name: mytypes.sample.runpod.crossplane.io
+  name: templates.serverless.runpod.crossplane.io
 spec:
-  group: sample.runpod.crossplane.io
+  group: serverless.runpod.crossplane.io
   names:
     categories:
     - crossplane
     - managed
     - runpod
-    kind: MyType
-    listKind: MyTypeList
-    plural: mytypes
-    singular: mytype
+    kind: Template
+    listKind: TemplateList
+    plural: templates
+    singular: template
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -34,7 +34,8 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: A MyType is an example API type.
+        description: Template is a private RunPod Serverless template backed by a
+          digest-pinned image.
         properties:
           apiVersion:
             description: |-
@@ -54,15 +55,62 @@ spec:
           metadata:
             type: object
           spec:
-            description: A MyTypeSpec defines the desired state of a MyType.
             properties:
               forProvider:
-                description: MyTypeParameters are the configurable fields of a MyType.
+                description: |-
+                  TemplateParameters are the supported, security-bounded RunPod template fields.
+                  API source: https://docs.runpod.io/api-reference/templates/POST/templates
                 properties:
-                  configurableField:
+                  containerDiskInGb:
+                    description: ContainerDiskInGB is ephemeral container disk capacity.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                  dockerEntrypoint:
+                    description: DockerEntrypoint overrides the image entrypoint.
+                    items:
+                      type: string
+                    maxItems: 32
+                    type: array
+                  dockerStartCmd:
+                    description: DockerStartCmd overrides the image command.
+                    items:
+                      type: string
+                    maxItems: 64
+                    type: array
+                  imageName:
+                    description: |-
+                      ImageName is an OCI image reference pinned to a sha256 digest.
+                      Mutable tags are deliberately rejected.
+                    pattern: ^[^[:space:]@]+@sha256:[a-f0-9]{64}$
+                    type: string
+                  name:
+                    description: Name is the unique human-readable template name.
+                    maxLength: 191
+                    minLength: 1
+                    type: string
+                  ports:
+                    description: Ports contains RunPod port declarations such as 8000/http.
+                    items:
+                      type: string
+                    maxItems: 16
+                    type: array
+                  volumeInGb:
+                    description: VolumeInGB is persistent volume capacity attached
+                      to workers.
+                    format: int32
+                    maximum: 1024
+                    minimum: 0
+                    type: integer
+                  volumeMountPath:
+                    description: VolumeMountPath is the persistent volume mount path.
+                    maxLength: 256
+                    pattern: ^/[A-Za-z0-9._/-]*$
                     type: string
                 required:
-                - configurableField
+                - imageName
+                - name
                 type: object
               managementPolicies:
                 default:
@@ -123,17 +171,20 @@ spec:
             - forProvider
             type: object
           status:
-            description: A MyTypeStatus represents the observed state of a MyType.
             properties:
               atProvider:
-                description: MyTypeObservation are the observable fields of a MyType.
                 properties:
-                  configurableField:
+                  id:
                     type: string
-                  observableField:
+                  imageName:
                     type: string
-                required:
-                - configurableField
+                  isServerless:
+                    type: boolean
+                  lastObservedAt:
+                    format: date-time
+                    type: string
+                  name:
+                    type: string
                 type: object
               conditions:
                 description: Conditions of the resource.

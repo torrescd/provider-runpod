@@ -4,7 +4,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.0
-  name: providerconfigs.runpod.crossplane.io
+  name: clusterproviderconfigs.runpod.crossplane.io
 spec:
   group: runpod.crossplane.io
   names:
@@ -12,11 +12,11 @@ spec:
     - crossplane
     - provider
     - runpod
-    kind: ProviderConfig
-    listKind: ProviderConfigList
-    plural: providerconfigs
-    singular: providerconfig
-  scope: Namespaced
+    kind: ClusterProviderConfig
+    listKind: ClusterProviderConfigList
+    plural: clusterproviderconfigs
+    singular: clusterproviderconfig
+  scope: Cluster
   versions:
   - additionalPrinterColumns:
     - jsonPath: .metadata.creationTimestamp
@@ -29,8 +29,7 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: A ProviderConfig configures a Helm 'provider', i.e. a connection
-          to a particular
+        description: A ClusterProviderConfig configures a RunPod provider.
         properties:
           apiVersion:
             description: |-
@@ -96,13 +95,13 @@ spec:
                     - namespace
                     type: object
                   source:
-                    description: Source of the provider credentials.
+                    description: |-
+                      Source of the provider credentials.
+                      Only a Kubernetes Secret is accepted. Environment, filesystem, and
+                      injected credentials are intentionally disabled to keep key provenance
+                      auditable and namespaced.
                     enum:
-                    - None
                     - Secret
-                    - InjectedIdentity
-                    - Environment
-                    - Filesystem
                     type: string
                 required:
                 - source

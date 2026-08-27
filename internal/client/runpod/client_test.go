@@ -56,7 +56,7 @@ func TestTemplateLifecycleUsesOfficialContractAndRedactsErrors(t *testing.T) {
 }
 
 func TestCreateTransportFailureIsNotRetried(t *testing.T) {
-	rt := roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("network down with no response") })
+	rt := roundTripFunc{fn: func(*http.Request) (*http.Response, error) { return nil, errors.New("network down with no response") }}
 	h := &http.Client{Transport: &rt, Timeout: time.Second}
 	c, err := New([]byte("safe-key"), WithHTTPClient(h))
 	if err != nil {
