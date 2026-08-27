@@ -1,0 +1,73 @@
+apiVersion: policies.kyverno.io/v1beta1
+kind: ImageValidatingPolicy
+metadata:
+  name: verify-runpod-template-images
+  annotations:
+    policies.kyverno.io/minversion: 1.19.0
+    policies.kyverno.io/description: >-
+      Fail-closed signature, provenance, and SBOM verification for every image
+      that provider-runpod may submit to the external RunPod runtime.
+spec:
+  failurePolicy: Fail
+  validationActions:
+    - Deny
+  webhookConfiguration:
+    timeoutSeconds: 30
+  evaluation:
+    background:
+      enabled: false
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - serverless.runpod.crossplane.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - templates
+  images:
+    - name: runpodTemplate
+      expression: "[object.spec.forProvider.imageName]"
+  matchImageReferences:
+    - glob: "*"
+  validationConfigurations:
+    mutateDigest: false
+    verifyDigest: true
+    required: true
+  attestors:
+    - name: approved-model-image-workflow
+      cosign:
+        keyless:
+          identities:
+            # Deliberately impossible for the GitHub Actions issuer. Replace
+            # this with one reviewed, exact workflow identity before admitting
+            # any Template. Never weaken this to a repository-wide wildcard.
+            - issuer: https://token.actions.githubusercontent.com
+              subject: urn:provider-runpod:unconfigured-deny-all
+        ctlog:
+          url: https://rekor.sigstore.dev
+  attestations:
+    - name: slsa-provenance
+      intoto:
+        type: https://slsa.dev/provenance/v1
+    - name: spdx-sbom
+      intoto:
+        type: https://spdx.dev/Document
+  validations:
+    - expression: >-
+        images.runpodTemplate
+        .map(image, verifyImageSignatures(image, [attestors.approved__dash__model__dash__image__dash__workflow]))
+        .all(result, result > 0)
+      message: Template image must have a valid signature from the approved model-image workflow
+    - expression: >-
+        images.runpodTemplate
+        .map(image, verifyAttestationSignatures(image, attestations.slsa__dash__provenance, [attestors.approved__dash__model__dash__image__dash__workflow]))
+        .all(result, result > 0)
+      message: Template image must have signed SLSA provenance from the approved model-image workflow
+    - expression: >-
+        images.runpodTemplate
+        .map(image, verifyAttestationSignatures(image, attestations.spdx__dash__sbom, [attestors.approved__dash__model__dash__image__dash__workflow]))
+        .all(result, result > 0)
+      message: Template image must have a signed SPDX SBOM from the approved model-image workflow
