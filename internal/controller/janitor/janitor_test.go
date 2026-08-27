@@ -82,7 +82,9 @@ func TestUnexpiredEndpointSchedulesAtDeadline(t *testing.T) {
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ep).Build()
 	r := &reconciler{kube: kube, now: func() time.Time { return now }}
 	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ep.Namespace, Name: ep.Name}})
-	if err != nil || result.RequeueAfter != time.Hour {
+	// Kubernetes timestamps are persisted at second precision, so allow for the
+	// sub-second component dropped by the fake API client round trip.
+	if err != nil || result.RequeueAfter <= 59*time.Minute || result.RequeueAfter > time.Hour {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
