@@ -905,7 +905,7 @@ jobs:
             "${ROUTER_IMAGE}@${ROUTER_DIGEST}" \
             "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"; do
             gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://slsa.dev/provenance/v1" >/dev/null
-            gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://spdx.dev/Document" >/dev/null
+            gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://spdx.dev/Document/v2.3" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type slsaprovenance1 --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
