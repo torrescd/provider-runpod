@@ -47,10 +47,10 @@ jobs:
           set -euo pipefail
           test "${GITHUB_REF}" = refs/heads/main
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
-          if git rev-parse --verify --quiet refs/tags/v0.1.0 >/dev/null; then
-            echo "v0.1.0 already exists; package bootstrap is only a pre-release visibility step" >&2
-            exit 1
-          fi
+          # Bootstrap candidates are keyed by the exact main SHA, so rerunning
+          # after a failed release or a workflow-only main fix is safe and
+          # necessary. The immutable release workflow still refuses to publish
+          # over an existing final tag or package digest.
           test -z "$(git status --porcelain)"
           successful_ci="$(gh api \
             -H 'Accept: application/vnd.github+json' \
