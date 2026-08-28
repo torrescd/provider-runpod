@@ -502,6 +502,7 @@ jobs:
               "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
           }
 
+          # The tag endpoint excludes drafts; filter the collection so reruns can adopt our draft.
           if release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end' 2>/dev/null)"; then
             jq -e --arg tag "${GITHUB_REF_NAME}" '.tag_name == $tag and ((.draft == true and (.immutable // false) == false) or (.draft == false and .immutable == true))' <<<"${release_json}" >/dev/null
             canonical_body="$(canonical_release_body)"
