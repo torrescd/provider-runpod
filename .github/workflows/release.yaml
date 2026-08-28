@@ -910,8 +910,16 @@ jobs:
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type slsaprovenance1 --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type spdxjson --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
-            DOCKER_CONFIG="${anonymous_docker_config}" docker pull --platform linux/amd64 "${artifact}" >/dev/null
-            DOCKER_CONFIG="${anonymous_docker_config}" docker pull --platform linux/arm64 "${artifact}" >/dev/null
+            manifest="$(DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${artifact}" --raw)"
+            repository="${artifact%@*}"
+            for arch in amd64 arm64; do
+              platform_digest="$(jq -er --arg arch "${arch}" '
+                [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest]
+                | if length == 1 then .[0] else error("expected exactly one linux/" + $arch + " manifest") end
+              ' <<<"${manifest}")"
+              [[ "${platform_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              DOCKER_CONFIG="${anonymous_docker_config}" docker pull "${repository}@${platform_digest}" >/dev/null
+            done
           done
 
       - name: Assemble, upload, and hash-verify the exact draft asset set
