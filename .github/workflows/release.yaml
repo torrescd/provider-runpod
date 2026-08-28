@@ -321,11 +321,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          immutable_settings="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "/repos/${GITHUB_REPOSITORY}/immutable-releases")"
-          test "$(jq -r .enabled <<<"${immutable_settings}")" = true
+          # Immutable releases are a repository-owner setting and the Actions
+          # token cannot read the administration endpoint. The immutable tag
+          # ruleset is enforced independently; this workflow still refuses to
+          # overwrite an existing release or final registry tag.
 
           resolve_tag_commit() {
             local object type sha depth=0

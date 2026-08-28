@@ -69,11 +69,12 @@ The tag-only release workflow rechecks public metadata and anonymous pulls. It
 is the only workflow with OIDC signing permission, and it verifies the exact
 `release.yaml@refs/tags/<version>` identity after signing.
 
-Before any release, configure a GitHub repository ruleset for `refs/tags/v*.*.*`
-that restricts tag updates and deletions (with no routine bypass actor), and
-protect `main` with the complete `CI` workflow as a required check. GitHub does
-not let a workflow make its own triggering tag immutable, so these repository
-settings are a manual release gate. The workflow independently requires a tag
+Before any release, enable GitHub immutable releases and configure a repository
+ruleset for `refs/tags/v*.*.*` that restricts tag updates and deletions (with no
+routine bypass actor), and protect `main` with the complete `CI` workflow as a
+required check. GitHub does not let a workflow make its own triggering tag
+immutable, so these repository settings are a manual release gate; the Actions
+token cannot read the administration setting. The workflow independently requires a tag
 creation event at the exact current `main` SHA, a successful `main` push CI run
 for that SHA, and either absent or exact-digest-matching semver/SHA package
 tags. It publishes
