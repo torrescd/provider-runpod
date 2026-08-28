@@ -19,10 +19,21 @@ var (
 
 // TemplateParameters are the supported, security-bounded RunPod template fields.
 // API source: https://docs.runpod.io/api-reference/templates/POST/templates
+// +kubebuilder:validation:XValidation:rule="self.ports.all(p, p.matches('^[1-9][0-9]{0,4}/(http|tcp)$'))",message="ports must use an explicit port/protocol declaration"
+// +kubebuilder:validation:XValidation:rule="self.ports.all(p, int(p.split('/')[0]) <= 65535)",message="ports must be in the range 1..65535"
 type TemplateParameters struct {
+	// MaxLifetimeSeconds bounds this Template even when the dependent Endpoint
+	// is never admitted or created. The independent reaper direct-lists all
+	// Endpoint references before initiating deletion.
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:validation:Maximum=86400
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="maxLifetimeSeconds is immutable"
+	MaxLifetimeSeconds int32 `json:"maxLifetimeSeconds"`
+
 	// Name is the unique human-readable template name.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=191
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9._-]*$`
 	Name string `json:"name"`
 
 	// ImageName is an OCI image reference pinned to a sha256 digest.
@@ -33,6 +44,7 @@ type TemplateParameters struct {
 	// ContainerDiskInGB is ephemeral container disk capacity.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=100
+	// +kubebuilder:default=50
 	// +optional
 	ContainerDiskInGB *int32 `json:"containerDiskInGb,omitempty"`
 
@@ -47,21 +59,16 @@ type TemplateParameters struct {
 	DockerStartCmd []string `json:"dockerStartCmd,omitempty"`
 
 	// Ports contains RunPod port declarations such as 8000/http.
+	// It is required because RunPod otherwise defaults to 8888/http and 22/tcp.
+	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
-	// +optional
-	Ports []string `json:"ports,omitempty"`
+	Ports []string `json:"ports"`
 
-	// VolumeInGB is persistent volume capacity attached to workers.
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1024
-	// +optional
-	VolumeInGB *int32 `json:"volumeInGb,omitempty"`
-
-	// VolumeMountPath is the persistent volume mount path.
-	// +kubebuilder:validation:Pattern=`^/[A-Za-z0-9._/-]*$`
-	// +kubebuilder:validation:MaxLength=256
-	// +optional
-	VolumeMountPath string `json:"volumeMountPath,omitempty"`
+	// VolumeInGB must be explicitly zero. RunPod otherwise defaults an omitted
+	// volume to 20 GiB and a /workspace mount; this bounded provider does not
+	// support persistent worker volumes.
+	// +kubebuilder:validation:Enum=0
+	VolumeInGB int32 `json:"volumeInGb"`
 }
 
 type TemplateObservation struct {
@@ -72,6 +79,10 @@ type TemplateObservation struct {
 	LastObservedAt metav1.Time `json:"lastObservedAt,omitempty"`
 }
 
+// TemplateSpec requires the full Crossplane lifecycle. A bounded Template may
+// not be orphaned when its Kubernetes object is removed by GitOps or the
+// Endpoint lifetime reaper.
+// +kubebuilder:validation:XValidation:rule="self.managementPolicies == ['*']",message="bounded Templates require managementPolicies exactly ['*']"
 type TemplateSpec struct {
 	xpv2.ManagedResourceSpec `json:",inline"`
 	ForProvider              TemplateParameters `json:"forProvider"`

@@ -34,8 +34,8 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Endpoint is a bounded RunPod Serverless endpoint. WorkersMin
-          is always zero.
+        description: Endpoint is a bounded RunPod Serverless endpoint with exactly
+          one worker.
         properties:
           apiVersion:
             description: |-
@@ -55,6 +55,10 @@ spec:
           metadata:
             type: object
           spec:
+            description: |-
+              EndpointSpec requires the full Crossplane lifecycle. The TTL janitor can
+              only guarantee external cleanup when Delete cannot be disabled through an
+              observe-only management policy.
             properties:
               forProvider:
                 description: |-
@@ -73,13 +77,14 @@ spec:
                     items:
                       type: string
                     maxItems: 16
+                    minItems: 1
                     type: array
                   deleteReferencedTemplateOnExpiry:
                     default: true
                     description: |-
                       DeleteReferencedTemplateOnExpiry deletes the referenced Kubernetes
                       Template CR after route withdrawal when the endpoint expires. It has no
-                      effect when templateId is used directly.
+                      effect when no reference is configured (which admission rejects).
                     type: boolean
                   executionTimeoutMs:
                     description: ExecutionTimeoutMS bounds an inference request.
@@ -113,10 +118,19 @@ spec:
                     x-kubernetes-validations:
                     - message: maxLifetimeSeconds is immutable
                       rule: self == oldSelf
+                  maxWorkerCostMilliUsdPerHour:
+                    description: |-
+                      MaxWorkerCostMilliUSDPerHour is a local fail-closed ceiling applied to
+                      every active worker's official cost fields. It is not sent to RunPod.
+                    format: int32
+                    maximum: 10000
+                    minimum: 1
+                    type: integer
                   name:
                     description: Name is the endpoint's human-readable name.
                     maxLength: 191
                     minLength: 1
+                    pattern: ^[A-Za-z0-9][A-Za-z0-9._-]*$
                     type: string
                   scalerType:
                     description: ScalerType controls RunPod autoscaling.
@@ -130,11 +144,6 @@ spec:
                     maximum: 100
                     minimum: 1
                     type: integer
-                  templateId:
-                    description: TemplateID is the external RunPod template ID. Prefer
-                      TemplateIDRef.
-                    minLength: 1
-                    type: string
                   templateIdRef:
                     description: TemplateIDRef references a Template in this namespace.
                     properties:
@@ -170,25 +179,38 @@ spec:
                     - name
                     type: object
                   workersMax:
-                    description: WorkersMax is deliberately capped for experiment
-                      cost control.
+                    description: WorkersMax is exactly one for experiment cost control.
                     format: int32
                     maximum: 1
-                    minimum: 0
+                    minimum: 1
+                    type: integer
+                  workersMin:
+                    description: |-
+                      WorkersMin is exactly one. The secured route cannot safely admit the
+                      first ordinary request to a newly placed scale-to-zero worker before the
+                      management API has exposed its cost, storage, and Secure Cloud fields.
+                    format: int32
+                    maximum: 1
+                    minimum: 1
                     type: integer
                 required:
+                - dataCenterIds
                 - executionTimeoutMs
                 - gpuTypeIds
                 - idleTimeout
                 - maxLifetimeSeconds
+                - maxWorkerCostMilliUsdPerHour
                 - name
                 - scalerType
                 - scalerValue
                 - workersMax
+                - workersMin
                 type: object
                 x-kubernetes-validations:
-                - message: exactly one of templateId or templateIdRef is required
-                  rule: has(self.templateId) != has(self.templateIdRef)
+                - message: templateIdRef is required
+                  rule: has(self.templateIdRef)
+                - message: dataCenterIds must be explicit RunPod identifiers
+                  rule: self.dataCenterIds.all(id, id.matches('^[A-Za-z0-9_-]+$'))
               managementPolicies:
                 default:
                 - '*'
@@ -247,10 +269,25 @@ spec:
             required:
             - forProvider
             type: object
+            x-kubernetes-validations:
+            - message: bounded Endpoints require managementPolicies exactly ['*']
+              rule: self.managementPolicies == ['*']
           status:
             properties:
               atProvider:
                 properties:
+                  flashBootDisabled:
+                    description: |-
+                      FlashBootDisabled records a successful provider write of flashboot=false.
+                      RunPod's v1 GET response does not publish this field, so the proof is
+                      retained only while the external ID and rollout Version remain unchanged.
+                    type: boolean
+                  flashBootEvidenceVersion:
+                    format: int32
+                    type: integer
+                  flashBootLastEnforcedAt:
+                    format: date-time
+                    type: string
                   id:
                     type: string
                   inferenceUrl:
@@ -260,6 +297,38 @@ spec:
                     type: string
                   templateId:
                     type: string
+                  templateImageDigest:
+                    type: string
+                  templateResourceGeneration:
+                    format: int64
+                    type: integer
+                  templateResourceUid:
+                    description: |-
+                      TemplateResourceUID, TemplateResourceGeneration, and TemplateImageDigest
+                      bind endpoint readiness to the exact managed Template revision whose
+                      rollout was observed. Consumers direct-read that Template before routing.
+                    type: string
+                  version:
+                    description: |-
+                      Version is RunPod's rollout revision. EndpointCheck binds every full
+                      model/tool verification to this value before model-router admits a route.
+                    format: int32
+                    type: integer
+                  workerSecurityObservedAt:
+                    format: date-time
+                    type: string
+                  workerSecurityProofVersion:
+                    format: int32
+                    type: integer
+                  workerSecurityValidated:
+                    description: |-
+                      WorkerSecurityValidated records that at least one active worker was
+                      directly observed with the bounded image, storage, cost, placement, and
+                      Secure Cloud evidence for WorkerSecurityProofVersion. Any subsequent
+                      management observation with zero workers clears the proof, so every cold
+                      start must complete a new wake -> management-observe handshake before the
+                      router can admit traffic.
+                    type: boolean
                   workersMax:
                     format: int32
                     type: integer

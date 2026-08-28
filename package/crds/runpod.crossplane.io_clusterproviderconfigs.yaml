@@ -53,32 +53,11 @@ spec:
               credentials:
                 description: Credentials required to authenticate to this provider.
                 properties:
-                  env:
-                    description: |-
-                      Env is a reference to an environment variable that contains credentials
-                      that must be used to connect to the provider.
-                    properties:
-                      name:
-                        description: Name is the name of an environment variable.
-                        type: string
-                    required:
-                    - name
-                    type: object
-                  fs:
-                    description: |-
-                      Fs is a reference to a filesystem location that contains credentials that
-                      must be used to connect to the provider.
-                    properties:
-                      path:
-                        description: Path is a filesystem path.
-                        type: string
-                    required:
-                    - path
-                    type: object
                   secretRef:
                     description: |-
-                      A SecretRef is a reference to a secret key that contains the credentials
-                      that must be used to connect to the provider.
+                      SecretRef identifies the single Kubernetes Secret key that contains the
+                      RunPod management credential. Environment and filesystem selectors are
+                      intentionally absent from this API.
                     properties:
                       key:
                         description: The key to select.
@@ -104,6 +83,7 @@ spec:
                     - Secret
                     type: string
                 required:
+                - secretRef
                 - source
                 type: object
             required:

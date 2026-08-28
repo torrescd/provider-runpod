@@ -9,7 +9,12 @@ spec:
     endpointIdRef:
       name: opencode-model
     expectedModelId: org/model-name
-    timeoutSeconds: 15
+    # Full health/model/tool verification (including failed retries) is at most
+    # hourly in steady state;
+    # 30-second reconciliation performs Kubernetes metadata checks plus the
+    # non-inference RunPod /health control-plane request.
+    verificationIntervalSeconds: 3600
+    timeoutSeconds: 180
     inferenceCredentialsSecretRef:
       name: runpod-inference
       key: apiKey

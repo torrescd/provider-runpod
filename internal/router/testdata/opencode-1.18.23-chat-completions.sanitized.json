@@ -1,0 +1,329 @@
+{
+  "max_tokens": 4096,
+  "messages": [
+    {
+      "content": "sanitized pinned OpenCode 1.18.23 system message",
+      "role": "system"
+    },
+    {
+      "content": "sanitized capture",
+      "role": "user"
+    }
+  ],
+  "model": "runpod-experiment",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "bash",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "command": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "timeout": {
+              "description": "sanitized captured description",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "workdir": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "edit",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "filePath": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "newString": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "oldString": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "replaceAll": {
+              "description": "sanitized captured description",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "filePath",
+            "oldString",
+            "newString"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "glob",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "path": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "pattern": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "grep",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "include": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "path": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "pattern": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "read",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "filePath": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "limit": {
+              "description": "sanitized captured description",
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "offset": {
+              "description": "sanitized captured description",
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "filePath"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "skill",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "name": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "task",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "command": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "description": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "subagent_type": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "task_id": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "prompt",
+            "subagent_type"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "todowrite",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "todos": {
+              "description": "sanitized captured description",
+              "items": {
+                "properties": {
+                  "content": {
+                    "description": "sanitized captured description",
+                    "type": "string"
+                  },
+                  "priority": {
+                    "description": "sanitized captured description",
+                    "type": "string"
+                  },
+                  "status": {
+                    "description": "sanitized captured description",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "content",
+                  "status",
+                  "priority"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "todos"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "webfetch",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "format": {
+              "default": "markdown",
+              "description": "sanitized captured description",
+              "enum": [
+                "text",
+                "markdown",
+                "html"
+              ],
+              "type": "string"
+            },
+            "timeout": {
+              "description": "sanitized captured description",
+              "type": "number"
+            },
+            "url": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "sanitized captured description",
+        "name": "write",
+        "parameters": {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "content": {
+              "description": "sanitized captured description",
+              "type": "string"
+            },
+            "filePath": {
+              "description": "sanitized captured description",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "filePath"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

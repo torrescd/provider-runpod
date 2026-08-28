@@ -3,7 +3,8 @@ kind: Provider
 metadata:
   name: provider-runpod
 spec:
-  # Replace the tag with the release digest from release-digests.txt.
-  package: ghcr.io/torrescd/provider-runpod:v0.1.0
+  # Replace this non-pullable placeholder with the verified package digest from
+  # release-digests.txt. Crossplane runs the runtime embedded in this xpkg.
+  package: ghcr.io/torrescd/provider-runpod@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   runtimeConfigRef:
     name: provider-runpod-hardened

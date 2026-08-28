@@ -10,7 +10,6 @@ spec:
   names:
     categories:
     - crossplane
-    - managed
     - runpod
     kind: EndpointCheck
     listKind: EndpointCheckList
@@ -22,7 +21,7 @@ spec:
     - jsonPath: .status.conditions[?(@.type=='Ready')].status
       name: READY
       type: string
-    - jsonPath: .spec.forProvider.endpointId
+    - jsonPath: .spec.forProvider.endpointIdRef.name
       name: ENDPOINT
       type: string
     - jsonPath: .metadata.creationTimestamp
@@ -58,11 +57,6 @@ spec:
                 description: EndpointCheckParameters define an authenticated, inference-only
                   readiness gate.
                 properties:
-                  endpointId:
-                    description: EndpointID is the external RunPod endpoint ID. Prefer
-                      EndpointIDRef.
-                    minLength: 1
-                    type: string
                   endpointIdRef:
                     description: EndpointIDRef references an Endpoint in this namespace.
                     properties:
@@ -130,11 +124,25 @@ spec:
                     - message: maxLifetimeSeconds is immutable
                       rule: self == oldSelf
                   timeoutSeconds:
-                    default: 15
-                    description: TimeoutSeconds bounds each probe request.
+                    default: 180
+                    description: |-
+                      TimeoutSeconds bounds each individual full-verification request. The
+                      default tolerates initial worker provisioning and model loading.
                     format: int32
-                    maximum: 60
+                    maximum: 600
                     minimum: 1
+                    type: integer
+                  verificationIntervalSeconds:
+                    default: 3600
+                    description: |-
+                      VerificationIntervalSeconds is the minimum interval between authenticated
+                      model/tool-call verifications in steady state. Kubernetes Endpoint status
+                      and credential metadata are checked every 30 seconds without invoking GPU
+                      inference. Relevant generation, endpoint, or credential changes bypass the
+                      interval and require immediate full re-verification.
+                    format: int32
+                    maximum: 86400
+                    minimum: 900
                     type: integer
                 required:
                 - expectedModelId
@@ -142,63 +150,8 @@ spec:
                 - maxLifetimeSeconds
                 type: object
                 x-kubernetes-validations:
-                - message: exactly one of endpointId or endpointIdRef is required
-                  rule: has(self.endpointId) != has(self.endpointIdRef)
-              managementPolicies:
-                default:
-                - '*'
-                description: |-
-                  THIS IS A BETA FIELD. It is on by default but can be opted out
-                  through a Crossplane feature flag.
-                  ManagementPolicies specify the array of actions Crossplane is allowed to
-                  take on the managed and external resources.
-                  See the design doc for more information: https://github.com/crossplane/crossplane/blob/499895a25d1a1a0ba1604944ef98ac7a1a71f197/design/design-doc-observe-only-resources.md?plain=1#L223
-                  and this one: https://github.com/crossplane/crossplane/blob/444267e84783136daa93568b364a5f01228cacbe/design/one-pager-ignore-changes.md
-                items:
-                  description: |-
-                    A ManagementAction represents an action that the Crossplane controllers
-                    can take on an external resource.
-                  enum:
-                  - Observe
-                  - Create
-                  - Update
-                  - Delete
-                  - LateInitialize
-                  - '*'
-                  type: string
-                type: array
-              providerConfigRef:
-                default:
-                  kind: ClusterProviderConfig
-                  name: default
-                description: |-
-                  ProviderConfigReference specifies how the provider that will be used to
-                  create, observe, update, and delete this managed resource should be
-                  configured.
-                properties:
-                  kind:
-                    description: Kind of the referenced object.
-                    type: string
-                  name:
-                    description: Name of the referenced object.
-                    type: string
-                required:
-                - kind
-                - name
-                type: object
-              writeConnectionSecretToRef:
-                description: |-
-                  WriteConnectionSecretToReference specifies the namespace and name of a
-                  Secret to which any connection details for this managed resource should
-                  be written. Connection details frequently include the endpoint, username,
-                  and password required to connect to the managed resource.
-                properties:
-                  name:
-                    description: Name of the secret.
-                    type: string
-                required:
-                - name
-                type: object
+                - message: endpointIdRef is required
+                  rule: has(self.endpointIdRef)
             required:
             - forProvider
             type: object
@@ -214,15 +167,46 @@ spec:
                     type: string
                   endpointId:
                     type: string
+                  endpointResourceGeneration:
+                    format: int64
+                    type: integer
+                  endpointResourceUid:
+                    description: |-
+                      EndpointResourceUID and EndpointResourceGeneration bind a verification to
+                      the exact referenced Kubernetes Endpoint identity and desired revision.
+                      EndpointVersion binds it to RunPod's observed rollout revision.
+                    type: string
+                  endpointVersion:
+                    format: int32
+                    type: integer
                   healthy:
                     type: boolean
                   inferenceUrl:
                     type: string
                   lastCheckedAt:
+                    description: |-
+                      LastCheckedAt records the latest cheap control-plane/credential liveness
+                      check. LastVerificationAttemptAt records every attempted authenticated
+                      health/model/tool verification, including failures and timeouts, so the
+                      minimum verification interval also bounds costly retry attempts.
+                      LastVerifiedAt records the latest successful full verification.
+                    format: date-time
+                    type: string
+                  lastVerificationAttemptAt:
+                    format: date-time
+                    type: string
+                  lastVerifiedAt:
                     format: date-time
                     type: string
                   modelVerified:
                     type: boolean
+                  templateImageDigest:
+                    type: string
+                  templateResourceGeneration:
+                    format: int64
+                    type: integer
+                  templateResourceUid:
+                    type: string
                   toolCallVerified:
                     type: boolean
                 type: object
@@ -272,18 +256,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              lastHandledReconcileAt:
-                description: |-
-                  LastHandledReconcileAt holds the value of the most recent
-                  reconcile-requested-at annotation token that the controller has
-                  processed. Users can compare this to the annotation to determine
-                  whether a reconcile request has been handled.
-                type: string
               observedGeneration:
                 description: |-
-                  ObservedGeneration is the latest metadata.generation
-                  which resulted in either a ready state, or stalled due to error
-                  it can not recover from without human intervention.
+                  ObservedGeneration is the EndpointCheck generation evaluated by the
+                  verifier. It is explicit because this auxiliary gate is not a Crossplane
+                  managed resource and has no providerConfig or management policies.
                 format: int64
                 type: integer
             type: object

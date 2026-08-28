@@ -27,8 +27,8 @@ func TestLoadCredentialRequiresManagementPurpose(t *testing.T) {
 		Key:             "token",
 	}
 	cd := apisv1alpha1.ProviderCredentials{
-		Source:                    xpv2.CredentialsSourceSecret,
-		CommonCredentialSelectors: xpv2.CommonCredentialSelectors{SecretRef: selector},
+		Source:    xpv2.CredentialsSourceSecret,
+		SecretRef: selector,
 	}
 
 	for name, purpose := range map[string]string{

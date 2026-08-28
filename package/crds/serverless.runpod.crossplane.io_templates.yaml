@@ -55,6 +55,10 @@ spec:
           metadata:
             type: object
           spec:
+            description: |-
+              TemplateSpec requires the full Crossplane lifecycle. A bounded Template may
+              not be orphaned when its Kubernetes object is removed by GitOps or the
+              Endpoint lifetime reaper.
             properties:
               forProvider:
                 description: |-
@@ -62,6 +66,7 @@ spec:
                   API source: https://docs.runpod.io/api-reference/templates/POST/templates
                 properties:
                   containerDiskInGb:
+                    default: 50
                     description: ContainerDiskInGB is ephemeral container disk capacity.
                     format: int32
                     maximum: 100
@@ -85,33 +90,54 @@ spec:
                       Mutable tags are deliberately rejected.
                     pattern: ^[^[:space:]@]+@sha256:[a-f0-9]{64}$
                     type: string
+                  maxLifetimeSeconds:
+                    description: |-
+                      MaxLifetimeSeconds bounds this Template even when the dependent Endpoint
+                      is never admitted or created. The independent reaper direct-lists all
+                      Endpoint references before initiating deletion.
+                    format: int32
+                    maximum: 86400
+                    minimum: 60
+                    type: integer
+                    x-kubernetes-validations:
+                    - message: maxLifetimeSeconds is immutable
+                      rule: self == oldSelf
                   name:
                     description: Name is the unique human-readable template name.
                     maxLength: 191
                     minLength: 1
+                    pattern: ^[A-Za-z0-9][A-Za-z0-9._-]*$
                     type: string
                   ports:
-                    description: Ports contains RunPod port declarations such as 8000/http.
+                    description: |-
+                      Ports contains RunPod port declarations such as 8000/http.
+                      It is required because RunPod otherwise defaults to 8888/http and 22/tcp.
                     items:
                       type: string
                     maxItems: 16
+                    minItems: 1
                     type: array
                   volumeInGb:
-                    description: VolumeInGB is persistent volume capacity attached
-                      to workers.
+                    description: |-
+                      VolumeInGB must be explicitly zero. RunPod otherwise defaults an omitted
+                      volume to 20 GiB and a /workspace mount; this bounded provider does not
+                      support persistent worker volumes.
+                    enum:
+                    - 0
                     format: int32
-                    maximum: 1024
-                    minimum: 0
                     type: integer
-                  volumeMountPath:
-                    description: VolumeMountPath is the persistent volume mount path.
-                    maxLength: 256
-                    pattern: ^/[A-Za-z0-9._/-]*$
-                    type: string
                 required:
                 - imageName
+                - maxLifetimeSeconds
                 - name
+                - ports
+                - volumeInGb
                 type: object
+                x-kubernetes-validations:
+                - message: ports must use an explicit port/protocol declaration
+                  rule: self.ports.all(p, p.matches('^[1-9][0-9]{0,4}/(http|tcp)$'))
+                - message: ports must be in the range 1..65535
+                  rule: self.ports.all(p, int(p.split('/')[0]) <= 65535)
               managementPolicies:
                 default:
                 - '*'
@@ -170,6 +196,9 @@ spec:
             required:
             - forProvider
             type: object
+            x-kubernetes-validations:
+            - message: bounded Templates require managementPolicies exactly ['*']
+              rule: self.managementPolicies == ['*']
           status:
             properties:
               atProvider:

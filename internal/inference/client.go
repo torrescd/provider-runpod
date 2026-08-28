@@ -19,11 +19,13 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/torrescd/provider-runpod/internal/identifier"
 )
 
 const maxResponseBytes = 1 << 20
 
-var validEndpointID = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var safeToolCallID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 type Result struct {
 	Healthy          bool
@@ -41,19 +43,21 @@ type Client struct {
 }
 
 func New(endpointID string, rawToken []byte, timeout time.Duration, opts ...Option) (*Client, error) {
-	token := strings.TrimSpace(string(rawToken))
-	if !validEndpointID.MatchString(endpointID) {
+	token := string(rawToken)
+	if identifier.ValidateRunPodID(endpointID) != nil {
 		return nil, errors.New("invalid RunPod endpoint ID")
 	}
-	if token == "" || len(token) > 4096 || strings.ContainsAny(token, "\r\n") {
+	if token == "" || token != strings.TrimSpace(token) || len(token) > 4096 || strings.ContainsAny(token, "\r\n") {
 		return nil, errors.New("inference token is empty or malformed")
 	}
-	if timeout <= 0 || timeout > 60*time.Second {
-		return nil, errors.New("inference timeout must be between one and sixty seconds")
+	if timeout <= 0 || timeout > 10*time.Minute {
+		return nil, errors.New("inference timeout must be between one second and ten minutes")
 	}
 	u, _ := url.Parse("https://api.runpod.ai")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = http.ProxyFromEnvironment
+	transport.ResponseHeaderTimeout = timeout
+	transport.MaxResponseHeaderBytes = 64 << 10
 	c := &Client{endpointID: endpointID, token: token, baseURL: u, httpClient: &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: rejectRedirect}}
 	for _, o := range opts {
 		if err := o(c); err != nil {
@@ -87,7 +91,7 @@ func (c *Client) Verify(ctx context.Context, expectedModelID string) (Result, er
 	if expectedModelID == "" {
 		return result, errors.New("expected model ID is required")
 	}
-	if err := c.do(ctx, http.MethodGet, c.endpointPath("/health"), nil, nil); err != nil {
+	if err := c.CheckHealth(ctx); err != nil {
 		return result, fmt.Errorf("authenticated health check failed: %w", err)
 	}
 	result.Healthy = true
@@ -131,8 +135,11 @@ func (c *Client) Verify(ctx context.Context, expectedModelID string) (Result, er
 	}
 	var response struct {
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
 					Function struct {
 						Name      string `json:"name"`
 						Arguments string `json:"arguments"`
@@ -144,23 +151,48 @@ func (c *Client) Verify(ctx context.Context, expectedModelID string) (Result, er
 	if err := c.do(ctx, http.MethodPost, c.openAIPath("/chat/completions"), request, &response); err != nil {
 		return result, fmt.Errorf("tool-call check failed: %w", err)
 	}
-	for _, choice := range response.Choices {
-		for _, call := range choice.Message.ToolCalls {
-			if call.Function.Name != "readiness_probe" {
-				continue
-			}
-			var args struct {
-				Token string `json:"token"`
-			}
-			if json.Unmarshal([]byte(call.Function.Arguments), &args) == nil && args.Token == "ready" {
-				result.ToolCallVerified = true
-			}
+	if len(response.Choices) == 1 && response.Choices[0].FinishReason == "tool_calls" &&
+		len(response.Choices[0].Message.ToolCalls) == 1 {
+		call := response.Choices[0].Message.ToolCalls[0]
+		if call.Type == "function" && safeToolCallID.MatchString(call.ID) &&
+			call.Function.Name == "readiness_probe" && exactReadinessArguments(call.Function.Arguments) {
+			result.ToolCallVerified = true
 		}
 	}
 	if !result.ToolCallVerified {
 		return result, errors.New("model did not return the required readiness tool call")
 	}
 	return result, nil
+}
+
+func exactReadinessArguments(raw string) bool {
+	if len(raw) == 0 || len(raw) > 1024 {
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') || !decoder.More() {
+		return false
+	}
+	key, err := decoder.Token()
+	if err != nil || key != "token" {
+		return false
+	}
+	var token string
+	if decoder.Decode(&token) != nil || token != "ready" || decoder.More() {
+		return false
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return false
+	}
+	return decoder.Decode(&struct{}{}) == io.EOF
+}
+
+// CheckHealth performs only RunPod's authenticated Serverless control-plane
+// health request. It does not submit an inference job or wake a worker.
+func (c *Client) CheckHealth(ctx context.Context) error {
+	return c.do(ctx, http.MethodGet, c.endpointPath("/health"), nil, nil)
 }
 
 func (c *Client) endpointPath(suffix string) string {

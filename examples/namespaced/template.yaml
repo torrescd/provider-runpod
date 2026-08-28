@@ -8,8 +8,14 @@ spec:
     kind: ClusterProviderConfig
     name: restricted-management
   forProvider:
+    # Five-hour inert envelope; the compute-bearing Endpoint/route below are
+    # capped at four hours so their deadline can never outlast this Template.
+    maxLifetimeSeconds: 18000
     name: xp-opencode-model
     imageName: ghcr.io/example/model@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    # Required and fixed at zero. Omission would make RunPod allocate its
+    # documented 20 GiB persistent-volume default mounted at /workspace.
+    volumeInGb: 0
     containerDiskInGb: 50
     ports:
       - 8000/http

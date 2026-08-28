@@ -20,6 +20,13 @@ rules:
   - apiGroups: ["serverless.runpod.crossplane.io"]
     resources: ["endpoints"]
     resourceNames: ["opencode-model"]
+    # patch is restricted by admission to the single
+    # crossplane.io/reconcile-requested-at metadata annotation. It lets the
+    # verifier request an immediate post-inference management observation.
+    verbs: ["get", "patch"]
+  - apiGroups: ["serverless.runpod.crossplane.io"]
+    resources: ["templates"]
+    resourceNames: ["opencode-model"]
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["secrets"]
@@ -64,8 +71,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: model-router
-          # Replace the tag with the release digest from release-digests.txt.
-          image: ghcr.io/torrescd/provider-runpod-model-router:v0.1.0
+          # Replace this non-pullable placeholder with the verified immutable
+          # model-router digest from release-digests.txt.
+          image: ghcr.io/torrescd/provider-runpod-model-router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           args: ["--namespace=runpod-system", "--listen=:8080"]
           env:
             - name: POD_NAMESPACE

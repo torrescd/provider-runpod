@@ -83,7 +83,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: generated-${{ github.sha }}
+          name: generated-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             apis/**/zz_generated.*.go
             package/crds/*.yaml
@@ -271,7 +271,7 @@ jobs:
       - name: Upload release dry-run evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-dry-run-${{ github.sha }}
+          name: release-dry-run-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/release-dry-run/*.xpkg
             trivy-release-dry-run-*.sarif

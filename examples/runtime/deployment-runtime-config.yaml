@@ -3,11 +3,6 @@ kind: DeploymentRuntimeConfig
 metadata:
   name: provider-runpod-hardened
 spec:
-  serviceAccountTemplate:
-    metadata:
-      # Pre-create this exact account with examples/rbac/ when Crossplane's
-      # RBAC manager is disabled.
-      name: provider-runpod
   deploymentTemplate:
     metadata:
       labels:
@@ -20,6 +15,10 @@ spec:
           labels:
             app.kubernetes.io/name: provider-runpod
         spec:
+          # This ServiceAccount is owned by GitOps and created by examples/rbac/.
+          # Do not add serviceAccountTemplate when Crossplane's RBAC manager is
+          # disabled; that would make package-manager ownership ambiguous.
+          serviceAccountName: provider-runpod
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

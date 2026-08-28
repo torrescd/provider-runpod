@@ -28,7 +28,11 @@ type ProviderCredentials struct {
 	// +kubebuilder:validation:Enum=Secret
 	Source xpv2.CredentialsSource `json:"source"`
 
-	xpv2.CommonCredentialSelectors `json:",inline"`
+	// SecretRef identifies the single Kubernetes Secret key that contains the
+	// RunPod management credential. Environment and filesystem selectors are
+	// intentionally absent from this API.
+	// +kubebuilder:validation:Required
+	SecretRef *xpv2.SecretKeySelector `json:"secretRef"`
 }
 
 type ProviderConfigSpec struct {

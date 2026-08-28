@@ -10,5 +10,8 @@ metadata:
       A clean-room Crossplane v2 provider for bounded RunPod Serverless
       Templates and Endpoints, with authenticated inference readiness gates.
 spec:
+  crossplane:
+    # v2 namespaced managed resources and safe-start semantics are required.
+    version: ">=v2.4.0-0"
   capabilities:
     - safe-start

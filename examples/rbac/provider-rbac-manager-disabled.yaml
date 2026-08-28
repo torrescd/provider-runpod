@@ -1,6 +1,7 @@
 # Apply this file before installing provider-runpod when the Crossplane Helm
 # value rbacManager.deploy=false. The ServiceAccount name must match the
-# DeploymentRuntimeConfig serviceAccountTemplate in examples/runtime/.
+# external serviceAccountName in examples/runtime/; the runtime config must not
+# declare a Crossplane-owned serviceAccountTemplate.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

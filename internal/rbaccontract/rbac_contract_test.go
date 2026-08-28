@@ -89,6 +89,12 @@ func TestModelRouterRBACContract(t *testing.T) {
 		Verbs:     []string{"get", "list", "watch", "update", "delete"},
 	})
 	assertRule(t, role.Rules, rbacv1.PolicyRule{
+		APIGroups:     []string{"serverless.runpod.crossplane.io"},
+		Resources:     []string{"templates"},
+		ResourceNames: []string{"opencode-model"},
+		Verbs:         []string{"get"},
+	})
+	assertRule(t, role.Rules, rbacv1.PolicyRule{
 		APIGroups: []string{"verification.runpod.crossplane.io"},
 		Resources: []string{"endpointchecks/status"},
 		Verbs:     []string{"update"},
@@ -97,7 +103,7 @@ func TestModelRouterRBACContract(t *testing.T) {
 		APIGroups:     []string{"serverless.runpod.crossplane.io"},
 		Resources:     []string{"endpoints"},
 		ResourceNames: []string{"opencode-model"},
-		Verbs:         []string{"get"},
+		Verbs:         []string{"get", "patch"},
 	})
 
 	binding := findManifest(t, docs, "RoleBinding", "provider-runpod-model-router")

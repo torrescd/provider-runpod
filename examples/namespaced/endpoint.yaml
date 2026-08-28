@@ -17,7 +17,12 @@ spec:
       - NVIDIA L4
     dataCenterIds:
       - EU-RO-1
+    # Secured routing requires one continuously provisioned worker so an
+    # ordinary request can never race management proof for a cold placement.
+    workersMin: 1
     workersMax: 1
+    # Local controller ceiling: USD 2.000 per active worker-hour.
+    maxWorkerCostMilliUsdPerHour: 2000
     idleTimeout: 5
     scalerType: QUEUE_DELAY
     scalerValue: 4

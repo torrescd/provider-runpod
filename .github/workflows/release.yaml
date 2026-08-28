@@ -5,11 +5,7 @@ on:
     tags:
       - "v*.*.*"
 
-permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+permissions: {}
 
 env:
   GO_VERSION: 1.25.13
@@ -22,6 +18,7 @@ env:
   TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
   SYFT_VERSION: v1.42.3
   SYFT_SHA256: 0d6be741479eddd2c8644a288990c04f3df0d609bbc1599a005532a9dff63509
+  COSIGN_VERSION: v2.6.0
   CONTROLLER_IMAGE: ghcr.io/torrescd/provider-runpod-controller
   ROUTER_IMAGE: ghcr.io/torrescd/provider-runpod-model-router
   PACKAGE_IMAGE: ghcr.io/torrescd/provider-runpod
@@ -30,23 +27,53 @@ env:
   SIGNING_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
-  release:
+  build:
+    name: Unprivileged build, test, and scan
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+      artifact_digest: ${{ steps.bundle.outputs.artifact-digest }}
     steps:
-      - name: Checkout exact tag
+      - name: Checkout exact tag without persisted credentials
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Validate immutable semver source
+      - name: Validate immutable semver source and required main CI
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "${{ github.event.before }}" = "0000000000000000000000000000000000000000"
           test "$(git rev-list -n1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "${GITHUB_SHA}"
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
           test -z "$(git status --porcelain)"
+          successful_ci="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yaml/runs?branch=main&event=push&status=completed&head_sha=${GITHUB_SHA}&per_page=100" \
+            --jq '[.workflow_runs[] | select(.head_sha == env.GITHUB_SHA and .head_branch == "main" and .event == "push" and .conclusion == "success")] | length')"
+          test "${successful_ci}" -ge 1
+
+      - name: Pin all artifact timestamps to the release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          source_date_epoch="$(git show -s --format=%ct "${GITHUB_SHA}")"
+          [[ "${source_date_epoch}" =~ ^[0-9]+$ ]]
+          test "${source_date_epoch}" -gt 0
+          echo "SOURCE_DATE_EPOCH=${source_date_epoch}" >> "${GITHUB_ENV}"
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
@@ -54,16 +81,20 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Test and build both architectures
+      - name: Test and validate binary dependency boundaries
         shell: bash
         run: |
           set -euo pipefail
-          go test ./...
-          for arch in amd64 arm64; do
-            mkdir -p "bin/linux_${arch}"
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w -X github.com/torrescd/provider-runpod/internal/version.Version=${GITHUB_REF_NAME}" -o "bin/linux_${arch}/provider" ./cmd/provider
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w" -o "bin/linux_${arch}/model-router" ./cmd/model-router
-          done
+          go test -race ./...
+          go vet ./...
+          if go list -deps ./cmd/provider | grep -E '/(endpointcheck|inference)$'; then
+            echo 'provider binary contains inference-verifier code' >&2
+            exit 1
+          fi
+          if go list -deps ./cmd/model-router | grep -E '/(management|client/runpod)$'; then
+            echo 'model-router binary contains management-client code' >&2
+            exit 1
+          fi
 
       - name: Set up pinned QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -85,111 +116,86 @@ jobs:
           install_dir="${RUNNER_TEMP}/provider-runpod-tools"
           mkdir -p "${install_dir}"
           cli="${install_dir}/crossplane"
-          curl --fail --silent --show-error --location --retry 3 \
-            --output "${cli}" \
+          curl --fail --silent --show-error --location --retry 3 --output "${cli}" \
             "https://cli.crossplane.io/stable/${CROSSPLANE_CLI_VERSION}/bin/linux_amd64/crossplane"
           printf '%s  %s\n' "${CROSSPLANE_CLI_SHA256}" "${cli}" | sha256sum --check --strict
           chmod 0755 "${cli}"
           echo "${install_dir}" >> "${GITHUB_PATH}"
           "${cli}" version --client
 
-      - name: Build architecture-specific Crossplane packages
+      - name: Build local provider packages and runtime archives
         shell: bash
-        run: bash hack/release/build-xpkgs.sh "${GITHUB_REF_NAME}" "${RELEASE_DIR}"
-
-      - name: Preflight public GHCR package records before publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          for package in provider-runpod provider-runpod-controller provider-runpod-model-router; do
-            metadata="$(gh api \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}")"
-            test "$(jq -r .visibility <<<"${metadata}")" = public
-            test "$(jq -r .repository.full_name <<<"${metadata}")" = "${GITHUB_REPOSITORY}"
-          done
-
-          anonymous_docker_config="$(mktemp -d)"
-          trap 'rm -rf "${anonymous_docker_config}"' EXIT
-          bootstrap_version="v0.0.0-bootstrap.${GITHUB_SHA}"
-          for artifact in \
-            "${PACKAGE_IMAGE}:${bootstrap_version}" \
-            "${CONTROLLER_IMAGE}:${bootstrap_version}" \
-            "${ROUTER_IMAGE}:${bootstrap_version}"; do
-            DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${artifact}" >/dev/null
-          done
-
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push controller
-        id: controller
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: cluster/images/provider-runpod/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: false
-          sbom: false
-          tags: |
-            ${{ env.CONTROLLER_IMAGE }}:${{ github.ref_name }}
-            ${{ env.CONTROLLER_IMAGE }}:sha-${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
-            org.opencontainers.image.licenses=Apache-2.0
-
-      - name: Build and push model-router
-        id: router
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: cluster/images/model-router/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: false
-          sbom: false
-          tags: |
-            ${{ env.ROUTER_IMAGE }}:${{ github.ref_name }}
-            ${{ env.ROUTER_IMAGE }}:sha-${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
-            org.opencontainers.image.licenses=Apache-2.0
-
-      - name: Resolve and validate platform digests
-        id: platforms
-        shell: bash
-        env:
-          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
-          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
-        run: |
-          set -euo pipefail
-          resolve_platform() {
-            local image="$1" digest="$2" arch="$3"
-            docker buildx imagetools inspect "${image}@${digest}" --raw |
-              jq -er --arg arch "${arch}" '
-                [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest]
-                | if length == 1 then .[0] else error("expected exactly one linux/" + $arch + " manifest") end'
+          compile_binaries() {
+            local output_root="$1" go_cache="$2"
+            mkdir -p "${output_root}" "${go_cache}"
+            for arch in amd64 arm64; do
+              mkdir -p "${output_root}/linux_${arch}"
+              GOCACHE="${go_cache}" CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+                go build -trimpath \
+                  -ldflags="-s -w -X github.com/torrescd/provider-runpod/internal/version.Version=${GITHUB_REF_NAME}" \
+                  -o "${output_root}/linux_${arch}/provider" ./cmd/provider
+              GOCACHE="${go_cache}" CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+                go build -trimpath -ldflags="-s -w" \
+                  -o "${output_root}/linux_${arch}/model-router" ./cmd/model-router
+            done
           }
-          [[ "${CONTROLLER_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "${ROUTER_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          {
-            echo "controller_amd64=$(resolve_platform "${CONTROLLER_IMAGE}" "${CONTROLLER_DIGEST}" amd64)"
-            echo "controller_arm64=$(resolve_platform "${CONTROLLER_IMAGE}" "${CONTROLLER_DIGEST}" arm64)"
-            echo "router_amd64=$(resolve_platform "${ROUTER_IMAGE}" "${ROUTER_DIGEST}" amd64)"
-            echo "router_arm64=$(resolve_platform "${ROUTER_IMAGE}" "${ROUTER_DIGEST}" arm64)"
-          } >> "${GITHUB_OUTPUT}"
+          stage_binaries() {
+            local source_root="$1"
+            rm -rf bin
+            for arch in amd64 arm64; do
+              install -D -m 0755 "${source_root}/linux_${arch}/provider" "bin/linux_${arch}/provider"
+              install -D -m 0755 "${source_root}/linux_${arch}/model-router" "bin/linux_${arch}/model-router"
+              cmp "${source_root}/linux_${arch}/provider" "bin/linux_${arch}/provider"
+              cmp "${source_root}/linux_${arch}/model-router" "bin/linux_${arch}/model-router"
+            done
+          }
+          build_router_archives() {
+            local output_dir="$1"
+            mkdir -p "${output_dir}"
+            for arch in amd64 arm64; do
+              docker buildx build \
+                --file cluster/images/model-router/Dockerfile \
+                --platform "linux/${arch}" \
+                --provenance=false \
+                --sbom=false \
+                --build-arg "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
+                --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+                --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+                --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+                --label "org.opencontainers.image.licenses=Apache-2.0" \
+                --tag "provider-runpod-model-router:${GITHUB_REF_NAME#v}-${arch}" \
+                --output "type=docker,dest=${output_dir}/model-router-linux-${arch}.tar,rewrite-timestamp=true" \
+                .
+            done
+          }
+
+          first_binary_root="${RUNNER_TEMP}/release-binaries-first"
+          second_binary_root="${RUNNER_TEMP}/release-binaries-second"
+          compile_binaries "${first_binary_root}" "${RUNNER_TEMP}/go-build-cache-first"
+          compile_binaries "${second_binary_root}" "${RUNNER_TEMP}/go-build-cache-second"
+          for arch in amd64 arm64; do
+            cmp "${first_binary_root}/linux_${arch}/provider" "${second_binary_root}/linux_${arch}/provider"
+            cmp "${first_binary_root}/linux_${arch}/model-router" "${second_binary_root}/linux_${arch}/model-router"
+          done
+
+          stage_binaries "${first_binary_root}"
+          bash hack/release/build-xpkgs.sh "${GITHUB_REF_NAME}" "${RELEASE_DIR}"
+          build_router_archives "${RELEASE_DIR}"
+
+          reproduction_dir="${RUNNER_TEMP}/release-reproduction"
+          stage_binaries "${second_binary_root}"
+          bash hack/release/build-xpkgs.sh "${GITHUB_REF_NAME}" "${reproduction_dir}"
+          build_router_archives "${reproduction_dir}"
+          for arch in amd64 arm64; do
+            cmp "${RELEASE_DIR}/provider-runtime-linux-${arch}.tar" \
+              "${reproduction_dir}/provider-runtime-linux-${arch}.tar"
+            cmp "${RELEASE_DIR}/model-router-linux-${arch}.tar" \
+              "${reproduction_dir}/model-router-linux-${arch}.tar"
+            cmp "${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-${arch}.xpkg" \
+              "${reproduction_dir}/provider-runpod-${GITHUB_REF_NAME}-linux-${arch}.xpkg"
+          done
 
       - name: Install checksum-verified Trivy
         shell: bash
@@ -206,117 +212,21 @@ jobs:
           echo "${install_dir}" >> "${GITHUB_PATH}"
           "${install_dir}/trivy" --version
 
-      - name: Scan controller linux-amd64 before signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          image-ref: ${{ env.CONTROLLER_IMAGE }}@${{ steps.platforms.outputs.controller_amd64 }}
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-controller-linux-amd64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan controller linux-arm64 before signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          image-ref: ${{ env.CONTROLLER_IMAGE }}@${{ steps.platforms.outputs.controller_arm64 }}
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-controller-linux-arm64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan model-router linux-amd64 before signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          image-ref: ${{ env.ROUTER_IMAGE }}@${{ steps.platforms.outputs.router_amd64 }}
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-model-router-linux-amd64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan model-router linux-arm64 before signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          image-ref: ${{ env.ROUTER_IMAGE }}@${{ steps.platforms.outputs.router_arm64 }}
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-model-router-linux-arm64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan embedded provider runtime linux-amd64 before publishing or signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          input: ${{ env.RELEASE_DIR }}/provider-runtime-linux-amd64.tar
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-provider-runtime-linux-amd64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan embedded provider runtime linux-arm64 before publishing or signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          input: ${{ env.RELEASE_DIR }}/provider-runtime-linux-arm64.tar
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-provider-runtime-linux-arm64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan provider package linux-amd64 before publishing or signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          input: ${{ env.RELEASE_DIR }}/provider-runpod-${{ github.ref_name }}-linux-amd64.xpkg
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-provider-package-linux-amd64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Scan provider package linux-arm64 before publishing or signing
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
-        with:
-          version: ${{ env.TRIVY_VERSION }}
-          skip-setup-trivy: true
-          input: ${{ env.RELEASE_DIR }}/provider-runpod-${{ github.ref_name }}-linux-arm64.xpkg
-          scanners: vuln,secret
-          format: sarif
-          output: trivy-provider-package-linux-arm64.sarif
-          severity: CRITICAL,HIGH
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-          exit-code: "1"
+      - name: Scan every local image and package before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            trivy image --input "${RELEASE_DIR}/provider-runtime-linux-${arch}.tar" \
+              --scanners vuln,secret --format sarif --output "trivy-controller-linux-${arch}.sarif" \
+              --severity CRITICAL,HIGH --ignore-unfixed=false --exit-code 1
+            trivy image --input "${RELEASE_DIR}/model-router-linux-${arch}.tar" \
+              --scanners vuln,secret --format sarif --output "trivy-model-router-linux-${arch}.sarif" \
+              --severity CRITICAL,HIGH --ignore-unfixed=false --exit-code 1
+            trivy image --input "${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-${arch}.xpkg" \
+              --scanners vuln,secret --format sarif --output "trivy-provider-package-linux-${arch}.sarif" \
+              --severity CRITICAL,HIGH --ignore-unfixed=false --exit-code 1
+          done
 
       - name: Install checksum-verified Syft
         shell: bash
@@ -333,187 +243,106 @@ jobs:
           echo "${install_dir}" >> "${GITHUB_PATH}"
           "${install_dir}/syft" version
 
-      - name: Generate per-platform SPDX SBOMs
-        shell: bash
-        run: |
-          set -euo pipefail
-          syft scan "${CONTROLLER_IMAGE}@${{ steps.platforms.outputs.controller_amd64 }}" --output spdx-json=sbom-controller-linux-amd64.spdx.json
-          syft scan "${CONTROLLER_IMAGE}@${{ steps.platforms.outputs.controller_arm64 }}" --output spdx-json=sbom-controller-linux-arm64.spdx.json
-          syft scan "${ROUTER_IMAGE}@${{ steps.platforms.outputs.router_amd64 }}" --output spdx-json=sbom-model-router-linux-amd64.spdx.json
-          syft scan "${ROUTER_IMAGE}@${{ steps.platforms.outputs.router_arm64 }}" --output spdx-json=sbom-model-router-linux-arm64.spdx.json
-          syft scan "docker-archive:${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg" --output spdx-json=sbom-provider-package-linux-amd64.spdx.json
-          syft scan "docker-archive:${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg" --output spdx-json=sbom-provider-package-linux-arm64.spdx.json
-          syft scan "docker-archive:${RELEASE_DIR}/provider-runtime-linux-amd64.tar" --output spdx-json=sbom-provider-runtime-linux-amd64.spdx.json
-          syft scan "docker-archive:${RELEASE_DIR}/provider-runtime-linux-arm64.tar" --output spdx-json=sbom-provider-runtime-linux-arm64.spdx.json
-
-      - name: Prove package SBOMs include their embedded runtime packages
+      - name: Generate and validate per-platform SPDX SBOMs
         shell: bash
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
+            syft scan "docker-archive:${RELEASE_DIR}/provider-runtime-linux-${arch}.tar" --output "spdx-json=sbom-controller-linux-${arch}.spdx.json"
+            syft scan "docker-archive:${RELEASE_DIR}/model-router-linux-${arch}.tar" --output "spdx-json=sbom-model-router-linux-${arch}.spdx.json"
+            syft scan "docker-archive:${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-${arch}.xpkg" --output "spdx-json=sbom-provider-package-linux-${arch}.spdx.json"
             jq -e \
-              --slurpfile runtime "sbom-provider-runtime-linux-${arch}.spdx.json" \
+              --slurpfile runtime "sbom-controller-linux-${arch}.spdx.json" \
               '
                 def package_key: [.name, (.versionInfo // ""), (.downloadLocation // "")];
                 def packages_without_source: [.packages[] | select(.primaryPackagePurpose != "CONTAINER") | package_key];
                 (.spdxVersion == "SPDX-2.3") and
-                (($runtime[0].spdxVersion == "SPDX-2.3")) and
+                ($runtime[0].spdxVersion == "SPDX-2.3") and
                 ((packages_without_source | length) > 0) and
                 (($runtime[0] | packages_without_source | length) > 0) and
                 ((($runtime[0] | packages_without_source) - packages_without_source) | length == 0)
               ' "sbom-provider-package-linux-${arch}.spdx.json" >/dev/null
           done
 
-      - name: Push scanned multi-architecture Crossplane package
-        id: package
+      - name: Integrity-bind the release handoff
         shell: bash
         run: |
           set -euo pipefail
-          amd64_xpkg="${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg"
-          arm64_xpkg="${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg"
-          crossplane xpkg push --package-files "${amd64_xpkg},${arm64_xpkg}" "${PACKAGE_IMAGE}:${GITHUB_REF_NAME}"
-          package_digest="$(docker buildx imagetools inspect "${PACKAGE_IMAGE}:${GITHUB_REF_NAME}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
-          [[ "${package_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
-          docker buildx imagetools inspect "${PACKAGE_IMAGE}@${package_digest}" --raw |
-            jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort | . == ["amd64", "arm64"]' >/dev/null
-          docker buildx imagetools inspect "${PACKAGE_IMAGE}@${package_digest}" --format '{{json .Image}}' |
-            jq -e '
-              (keys | sort) == ["linux/amd64", "linux/arm64"] and
-              .["linux/amd64"].os == "linux" and
-              .["linux/amd64"].architecture == "amd64" and
-              .["linux/amd64"].config.User == "65532:65532" and
-              .["linux/amd64"].config.Entrypoint == ["/usr/local/bin/crossplane-runpod-provider"] and
-              .["linux/arm64"].os == "linux" and
-              .["linux/arm64"].architecture == "arm64" and
-              .["linux/arm64"].config.User == "65532:65532" and
-              .["linux/arm64"].config.Entrypoint == ["/usr/local/bin/crossplane-runpod-provider"]
-            ' >/dev/null
-          echo "digest=${package_digest}" >> "${GITHUB_OUTPUT}"
+          sha256sum \
+            "${RELEASE_DIR}"/*.tar \
+            "${RELEASE_DIR}"/*.xpkg \
+            sbom-*.spdx.json \
+            trivy-*.sarif > BUILD-SHA256SUMS
+          sha256sum --check --strict BUILD-SHA256SUMS
+
+      - name: Upload immutable release handoff
+        id: bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-handoff-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            dist/release/*.tar
+            dist/release/*.xpkg
+            sbom-*.spdx.json
+            trivy-*.sarif
+            BUILD-SHA256SUMS
+
+  publish:
+    name: Minimal privileged sign and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    steps:
+      - name: Set up pinned Buildx and BuildKit
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
-          cosign-release: v3.0.5
+          cosign-release: ${{ env.COSIGN_VERSION }}
 
-      - name: Keyless sign all immutable artifacts
-        shell: bash
-        env:
-          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
-          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
-          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
-        run: |
-          set -euo pipefail
-          cosign sign --yes "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}"
-          cosign sign --yes "${ROUTER_IMAGE}@${ROUTER_DIGEST}"
-          cosign sign --yes "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"
-
-      - name: Verify exact keyless signing identity
-        shell: bash
-        env:
-          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
-          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
-          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
-        run: |
-          set -euo pipefail
-          cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" --output json "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" > cosign-verification-controller.json
-          cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" --output json "${ROUTER_IMAGE}@${ROUTER_DIGEST}" > cosign-verification-model-router.json
-          cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" --output json "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}" > cosign-verification-provider-package.json
-
-      - name: Attest controller SLSA provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ${{ env.CONTROLLER_IMAGE }}
-          subject-digest: ${{ steps.controller.outputs.digest }}
-          push-to-registry: true
-
-      - name: Attest model-router SLSA provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ${{ env.ROUTER_IMAGE }}
-          subject-digest: ${{ steps.router.outputs.digest }}
-          push-to-registry: true
-
-      - name: Attest provider package SLSA provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
-        with:
-          subject-name: ${{ env.PACKAGE_IMAGE }}
-          subject-digest: ${{ steps.package.outputs.digest }}
-          push-to-registry: true
-
-      - name: Attest controller linux-amd64 SPDX SBOM
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
-        with:
-          subject-name: ${{ env.CONTROLLER_IMAGE }}
-          subject-digest: ${{ steps.controller.outputs.digest }}
-          sbom-path: sbom-controller-linux-amd64.spdx.json
-          push-to-registry: true
-
-      - name: Attest controller linux-arm64 SPDX SBOM
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
-        with:
-          subject-name: ${{ env.CONTROLLER_IMAGE }}
-          subject-digest: ${{ steps.controller.outputs.digest }}
-          sbom-path: sbom-controller-linux-arm64.spdx.json
-          push-to-registry: true
-
-      - name: Attest model-router linux-amd64 SPDX SBOM
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
-        with:
-          subject-name: ${{ env.ROUTER_IMAGE }}
-          subject-digest: ${{ steps.router.outputs.digest }}
-          sbom-path: sbom-model-router-linux-amd64.spdx.json
-          push-to-registry: true
-
-      - name: Attest model-router linux-arm64 SPDX SBOM
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
-        with:
-          subject-name: ${{ env.ROUTER_IMAGE }}
-          subject-digest: ${{ steps.router.outputs.digest }}
-          sbom-path: sbom-model-router-linux-arm64.spdx.json
-          push-to-registry: true
-
-      - name: Attest provider package linux-amd64 SPDX SBOM
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
-        with:
-          subject-name: ${{ env.PACKAGE_IMAGE }}
-          subject-digest: ${{ steps.package.outputs.digest }}
-          sbom-path: sbom-provider-package-linux-amd64.spdx.json
-          push-to-registry: true
-
-      - name: Attest provider package linux-arm64 SPDX SBOM
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
-        with:
-          subject-name: ${{ env.PACKAGE_IMAGE }}
-          subject-digest: ${{ steps.package.outputs.digest }}
-          sbom-path: sbom-provider-package-linux-arm64.spdx.json
-          push-to-registry: true
-
-      - name: Verify registry SLSA and SPDX attestations
+      - name: Preflight public packages, immutable releases, tag identity, and draft
+        id: release_preflight
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
-          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
-          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
         run: |
           set -euo pipefail
-          for artifact in \
-            "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" \
-            "${ROUTER_IMAGE}@${ROUTER_DIGEST}" \
-            "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"; do
-            gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://slsa.dev/provenance/v1" >/dev/null
-            gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://spdx.dev/Document" >/dev/null
-          done
+          immutable_settings="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/immutable-releases")"
+          test "$(jq -r .enabled <<<"${immutable_settings}")" = true
 
-      - name: Require public GHCR packages and prove anonymous access
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
-          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
-          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
-        run: |
-          set -euo pipefail
+          resolve_tag_commit() {
+            local object type sha depth=0
+            object="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")"
+            type="$(jq -r .object.type <<<"${object}")"
+            sha="$(jq -r .object.sha <<<"${object}")"
+            while test "${type}" = tag; do
+              depth=$((depth + 1)); test "${depth}" -le 5
+              object="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "/repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
+              type="$(jq -r .object.type <<<"${object}")"
+              sha="$(jq -r .object.sha <<<"${object}")"
+            done
+            test "${type}" = commit
+            printf '%s' "${sha}"
+          }
+          test "$(resolve_tag_commit)" = "${GITHUB_SHA}"
+
           for package in provider-runpod provider-runpod-controller provider-runpod-model-router; do
             metadata="$(gh api \
               -H 'Accept: application/vnd.github+json' \
@@ -524,50 +353,1091 @@ jobs:
           done
 
           anonymous_docker_config="$(mktemp -d)"
-          trap 'rm -rf "${anonymous_docker_config}"' EXIT
+          bootstrap_version="v0.0.0-bootstrap.${GITHUB_SHA}"
+          for artifact in \
+            "${PACKAGE_IMAGE}:${bootstrap_version}" \
+            "${CONTROLLER_IMAGE}:${bootstrap_version}" \
+            "${ROUTER_IMAGE}:${bootstrap_version}"; do
+            DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${artifact}" >/dev/null
+          done
+
+          expected_release_assets() {
+            printf '%s\n' \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg" \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg" \
+              BUILD-SHA256SUMS SHA256SUMS release-digests.txt
+            for component in controller model-router provider-package; do
+              printf '%s\n' \
+                "cosign-verification-${component}.json" \
+                "${component}-slsa.sigstore.json"
+              for arch in amd64 arm64; do
+                printf '%s\n' \
+                  "sbom-${component}-linux-${arch}.spdx.json" \
+                  "trivy-${component}-linux-${arch}.sarif" \
+                  "${component}-linux-${arch}-spdx.sigstore.json"
+              done
+            done
+          }
+          asset_digest_snapshot() {
+            jq -ce '
+              [.assets[] | {name, digest}] | sort_by(.name) |
+              if all(.[];
+                ((.name | type) == "string") and
+                ((.digest | type) == "string") and
+                (.digest | test("^sha256:[0-9a-f]{64}$"))
+              ) then . else error("release assets are missing GitHub SHA-256 digests") end
+            ' <<<"$1"
+          }
+          validate_release_digests() {
+            python3 - "$1" <<'PY'
+          import os, pathlib, re, sys
+
+          path = pathlib.Path(sys.argv[1])
+          try:
+              text = path.read_bytes().decode("utf-8")
+          except UnicodeDecodeError as error:
+              raise SystemExit("release-digests.txt is not valid UTF-8") from error
+          if "\r" in text or "\0" in text or not text.endswith("\n"):
+              raise SystemExit("release-digests.txt has invalid line encoding")
+          lines = text[:-1].split("\n")
+          keys = [
+              "release-tag",
+              "release-ref",
+              "source-commit",
+              "handoff-artifact-id",
+              "handoff-digest",
+              "package-ref",
+              "controller-ref",
+              "model-router-ref",
+              "signing-identity",
+              "signing-issuer",
+          ]
+          if len(lines) != len(keys):
+              raise SystemExit("release-digests.txt has missing or extra lines")
+          values = {}
+          for expected_key, line in zip(keys, lines, strict=True):
+              key, separator, value = line.partition("=")
+              if separator != "=" or key != expected_key or not value or key in values:
+                  raise SystemExit(f"invalid release-digests.txt line: {line!r}")
+              values[key] = value
+
+          expected = {
+              "release-tag": os.environ["GITHUB_REF_NAME"],
+              "release-ref": os.environ["GITHUB_REF"],
+              "source-commit": os.environ["GITHUB_SHA"],
+              "signing-identity": os.environ["SIGNING_IDENTITY"],
+              "signing-issuer": os.environ["SIGNING_ISSUER"],
+          }
+          for key, value in expected.items():
+              if values[key] != value:
+                  raise SystemExit(f"release evidence mismatch for {key}")
+          if not re.fullmatch(r"[1-9][0-9]*", values["handoff-artifact-id"]):
+              raise SystemExit("invalid handoff artifact ID in release evidence")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", values["handoff-digest"]):
+              raise SystemExit("invalid handoff digest in release evidence")
+          images = {
+              "package-ref": os.environ["PACKAGE_IMAGE"],
+              "controller-ref": os.environ["CONTROLLER_IMAGE"],
+              "model-router-ref": os.environ["ROUTER_IMAGE"],
+          }
+          for key, image in images.items():
+              if re.fullmatch(re.escape(image) + r"@sha256:[0-9a-f]{64}", values[key]) is None:
+                  raise SystemExit(f"invalid final image reference for {key}")
+          PY
+          }
+          verify_immutable_release_assets() {
+            local release_json="$1" release_dir="$2"
+            local expected actual downloaded asset_snapshot
+            expected="$(expected_release_assets | LC_ALL=C sort)"
+            actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+            test "${actual}" = "${expected}"
+            asset_snapshot="$(asset_digest_snapshot "${release_json}")"
+            gh release download "${GITHUB_REF_NAME}" --dir "${release_dir}"
+            if find "${release_dir}" -mindepth 1 ! -type f -print -quit | grep -q .; then
+              echo 'published release contains a non-regular asset' >&2
+              return 1
+            fi
+            downloaded="$(find "${release_dir}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+            test "${downloaded}" = "${expected}"
+            python3 - "${release_dir}" "${asset_snapshot}" <<'PY'
+          import hashlib, json, pathlib, re, stat, sys
+
+          root = pathlib.Path(sys.argv[1])
+          files = {path.name for path in root.iterdir() if path.is_file()}
+          api_digests = {item["name"]: item["digest"] for item in json.loads(sys.argv[2])}
+          if set(api_digests) != files:
+              raise SystemExit("GitHub asset digest set does not match downloaded assets")
+          actual_digests = {}
+          for name in files:
+              path = root / name
+              mode = path.lstat().st_mode
+              if not stat.S_ISREG(mode):
+                  raise SystemExit(f"release asset is not a regular file: {name!r}")
+              hasher = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+              actual_digests[name] = hasher.hexdigest()
+              if api_digests[name] != f"sha256:{actual_digests[name]}":
+                  raise SystemExit(f"GitHub asset digest mismatch: {name!r}")
+          expected = files - {"SHA256SUMS"}
+          checksums = {}
+          for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if match is None:
+                  raise SystemExit(f"invalid SHA256SUMS line: {line!r}")
+              digest, name = match.groups()
+              if name == "SHA256SUMS" or name in checksums:
+                  raise SystemExit(f"invalid or duplicate checksum name: {name!r}")
+              checksums[name] = digest
+          if set(checksums) != expected:
+              raise SystemExit("SHA256SUMS does not bind the exact immutable asset set")
+          for name, expected_digest in checksums.items():
+              if actual_digests[name] != expected_digest:
+                  raise SystemExit(f"release asset digest mismatch: {name!r}")
+          PY
+            (cd "${release_dir}" && sha256sum --check --strict SHA256SUMS)
+          }
+          canonical_release_body() {
+            printf '<!-- provider-runpod automated release -->\n\nAutomated immutable release %s for commit %s.\n\nWorkflow run: %s/%s/actions/runs/%s' \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+          }
+
+          if release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null)"; then
+            jq -e --arg tag "${GITHUB_REF_NAME}" '.tag_name == $tag and ((.draft == true and (.immutable // false) == false) or (.draft == false and .immutable == true))' <<<"${release_json}" >/dev/null
+            canonical_body="$(canonical_release_body)"
+            if test "$(jq -r .draft <<<"${release_json}")" = true; then
+              jq -e '.author.login == "github-actions[bot]" and .author.type == "Bot"' <<<"${release_json}" >/dev/null
+              release_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"${release_json}")"
+              gh api --method PATCH \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+                -f "name=${GITHUB_REF_NAME}" -f "body=${canonical_body}" \
+                -F draft=true -F prerelease=false >/dev/null
+              release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+              jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+                .tag_name == $tag and .name == $tag and .body == $body and
+                .author.login == "github-actions[bot]" and .author.type == "Bot" and
+                .draft == true and .prerelease == false and (.immutable // false) == false
+              ' <<<"${release_json}" >/dev/null
+              echo 'state=draft' >> "${GITHUB_OUTPUT}"
+            else
+              jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+                .tag_name == $tag and .name == $tag and .body == $body and
+                .author.login == "github-actions[bot]" and .author.type == "Bot" and
+                .draft == false and .prerelease == false and .immutable == true
+              ' <<<"${release_json}" >/dev/null
+              published_release_dir="$(mktemp -d)"
+              verify_immutable_release_assets "${release_json}" "${published_release_dir}"
+              validate_release_digests "${published_release_dir}/release-digests.txt"
+              mapfile -t evidence_lines < "${published_release_dir}/release-digests.txt"
+              artifacts=(
+                "${evidence_lines[5]#package-ref=}"
+                "${evidence_lines[6]#controller-ref=}"
+                "${evidence_lines[7]#model-router-ref=}"
+              )
+              anonymous_docker_config="$(mktemp -d)"
+              for artifact in "${artifacts[@]}"; do
+                DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${artifact}" >/dev/null
+                DOCKER_CONFIG="${anonymous_docker_config}" cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+                DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type slsaprovenance1 --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+                DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type spdxjson --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+                image="${artifact%@*}"
+                digest="${artifact#*@}"
+                for tag in "${GITHUB_REF_NAME}" "sha-${GITHUB_SHA}"; do
+                  actual="$(DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${image}:${tag}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+                  test "${actual}" = "${digest}"
+                done
+              done
+              echo 'state=published' >> "${GITHUB_OUTPUT}"
+            fi
+          else
+            canonical_body="$(canonical_release_body)"
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --draft \
+              --title "${GITHUB_REF_NAME}" --notes "${canonical_body}"
+            release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+            jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+              .tag_name == $tag and .name == $tag and .body == $body and
+              .author.login == "github-actions[bot]" and .author.type == "Bot" and
+              .draft == true and .prerelease == false and (.immutable // false) == false
+            ' <<<"${release_json}" >/dev/null
+            echo 'state=draft' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Authenticated raw download and exact ZIP validation
+        id: handoff
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "${ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]
+          raw_expected="${EXPECTED_ARTIFACT_DIGEST}"
+          if [[ "${raw_expected}" =~ ^[0-9a-f]{64}$ ]]; then
+            expected="sha256:${raw_expected}"
+          elif [[ "${raw_expected}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            expected="${raw_expected}"
+          else
+            echo 'upload-artifact returned an invalid artifact digest' >&2
+            exit 1
+          fi
+          [[ "${expected}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          metadata="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}")"
+          test "$(jq -r .expired <<<"${metadata}")" = false
+          test "$(jq -r .digest <<<"${metadata}")" = "${expected}"
+          test "$(jq -r .workflow_run.head_sha <<<"${metadata}")" = "${GITHUB_SHA}"
+          test "$(jq -r .workflow_run.id <<<"${metadata}")" = "${GITHUB_RUN_ID}"
+          test "$(jq -r .name <<<"${metadata}")" = "release-handoff-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          curl --fail --silent --show-error --location --retry 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' --output handoff.zip \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip"
+          actual="sha256:$(sha256sum handoff.zip | awk '{print $1}')"
+          test "${actual}" = "${expected}"
+          echo "artifact_id=${ARTIFACT_ID}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${expected}" >> "${GITHUB_OUTPUT}"
+
+          python3 - <<'PY'
+          import os, pathlib, stat, zipfile
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = {"BUILD-SHA256SUMS"}
+          for arch in ("amd64", "arm64"):
+              expected.update({
+                  f"dist/release/provider-runtime-linux-{arch}.tar",
+                  f"dist/release/model-router-linux-{arch}.tar",
+                  f"dist/release/provider-runpod-{tag}-linux-{arch}.xpkg",
+                  f"sbom-controller-linux-{arch}.spdx.json",
+                  f"sbom-model-router-linux-{arch}.spdx.json",
+                  f"sbom-provider-package-linux-{arch}.spdx.json",
+                  f"trivy-controller-linux-{arch}.sarif",
+                  f"trivy-model-router-linux-{arch}.sarif",
+                  f"trivy-provider-package-linux-{arch}.sarif",
+              })
+          with zipfile.ZipFile("handoff.zip") as archive:
+              infos = archive.infolist()
+              names = [entry.filename for entry in infos]
+              if len(names) != len(set(names)) or set(names) != expected:
+                  raise SystemExit(f"unexpected or duplicate handoff entries: {sorted(names)}")
+              total = 0
+              for entry in infos:
+                  path = pathlib.PurePosixPath(entry.filename)
+                  mode = (entry.external_attr >> 16) & 0xFFFF
+                  if path.is_absolute() or ".." in path.parts or "\\" in entry.filename or entry.is_dir():
+                      raise SystemExit(f"unsafe handoff path: {entry.filename!r}")
+                  if mode and (stat.S_ISLNK(mode) or not stat.S_ISREG(mode)):
+                      raise SystemExit(f"non-regular handoff entry: {entry.filename!r}")
+                  total += entry.file_size
+              if total > 3 * 1024 * 1024 * 1024:
+                  raise SystemExit("handoff exceeds uncompressed size bound")
+              archive.extractall("bundle")
+          PY
+
+      - name: Verify every handed-off byte
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        working-directory: bundle
+        run: |
+          set -euo pipefail
+          if find . -type l -print -quit | grep -q .; then
+            echo 'release handoff contains a symbolic link' >&2
+            exit 1
+          fi
+          sha256sum --check --strict BUILD-SHA256SUMS
+          test "$(find dist/release -maxdepth 1 -type f -name '*.xpkg' | wc -l)" -eq 2
+          test "$(find dist/release -maxdepth 1 -type f -name '*.tar' | wc -l)" -eq 4
+          test "$(find . -maxdepth 1 -type f -name 'sbom-*.spdx.json' | wc -l)" -eq 6
+          test "$(find . -maxdepth 1 -type f -name 'trivy-*.sarif' | wc -l)" -eq 6
+
+      - name: Install checksum-verified Crossplane CLI
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/provider-runpod-tools"
+          mkdir -p "${install_dir}"
+          cli="${install_dir}/crossplane"
+          curl --fail --silent --show-error --location --retry 3 --output "${cli}" \
+            "https://cli.crossplane.io/stable/${CROSSPLANE_CLI_VERSION}/bin/linux_amd64/crossplane"
+          printf '%s  %s\n' "${CROSSPLANE_CLI_SHA256}" "${cli}" | sha256sum --check --strict
+          chmod 0755 "${cli}"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+          "${cli}" version --client
+
+      - name: Log in to GHCR
+        if: steps.release_preflight.outputs.state != 'published'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push scanned controller and model-router staging digests
+        if: steps.release_preflight.outputs.state != 'published'
+        id: images
+        shell: bash
+        working-directory: bundle
+        run: |
+          set -euo pipefail
+          stage="staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          version="${GITHUB_REF_NAME#v}"
+          push_platforms() {
+            local image="$1" local_name="$2" archive_prefix="$3" output_prefix="$4"
+            local digests=()
+            for arch in amd64 arm64; do
+              docker load --input "${RELEASE_DIR}/${archive_prefix}-linux-${arch}.tar" >/dev/null
+              docker tag "${local_name}:${version}-${arch}" "${image}:${stage}-${arch}"
+              docker push "${image}:${stage}-${arch}" >/dev/null
+              digest="$(docker buildx imagetools inspect "${image}:${stage}-${arch}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+              [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              digests+=("${digest}")
+              echo "${output_prefix}_${arch}=${digest}" >> "${GITHUB_OUTPUT}"
+            done
+            docker buildx imagetools create --tag "${image}:${stage}" \
+              "${image}@${digests[0]}" "${image}@${digests[1]}"
+            digest="$(docker buildx imagetools inspect "${image}:${stage}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            echo "${output_prefix}_digest=${digest}" >> "${GITHUB_OUTPUT}"
+          }
+          push_platforms "${CONTROLLER_IMAGE}" provider-runpod-runtime provider-runtime controller
+          push_platforms "${ROUTER_IMAGE}" provider-runpod-model-router model-router router
+
+      - name: Push scanned provider package staging digest
+        if: steps.release_preflight.outputs.state != 'published'
+        id: package
+        shell: bash
+        working-directory: bundle
+        run: |
+          set -euo pipefail
+          stage="staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          crossplane xpkg push --package-files \
+            "${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg,${RELEASE_DIR}/provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg" \
+            "${PACKAGE_IMAGE}:${stage}"
+          digest="$(docker buildx imagetools inspect "${PACKAGE_IMAGE}:${stage}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "${PACKAGE_IMAGE}@${digest}" --raw |
+            jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort | . == ["amd64", "arm64"]' >/dev/null
+          docker buildx imagetools inspect "${PACKAGE_IMAGE}@${digest}" --format '{{json .Image}}' |
+            jq -e '
+              (keys | sort) == ["linux/amd64", "linux/arm64"] and
+              .["linux/amd64"].config.User == "65532:65532" and
+              .["linux/amd64"].config.Entrypoint == ["/usr/local/bin/crossplane-runpod-provider"] and
+              .["linux/arm64"].config.User == "65532:65532" and
+              .["linux/arm64"].config.Entrypoint == ["/usr/local/bin/crossplane-runpod-provider"]
+            ' >/dev/null
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create legacy-compatible SLSA/SPDX attestations, sign, and verify staging digests
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        working-directory: bundle
+        env:
+          CONTROLLER_DIGEST: ${{ steps.images.outputs.controller_digest }}
+          ROUTER_DIGEST: ${{ steps.images.outputs.router_digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -euo pipefail
+          attest_artifact() {
+            local key="$1" image="$2" digest="$3" sbom_prefix="$4"
+            local artifact="${image}@${digest}"
+            jq -n \
+              --arg buildType "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_SHA}" \
+              --arg source "git+${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}@refs/tags/${GITHUB_REF_NAME}" \
+              --arg sha "${GITHUB_SHA}" \
+              --arg builder "${SIGNING_IDENTITY}" \
+              --arg invocation "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+              --arg subject "${artifact}" \
+              '{
+                buildDefinition: {
+                  buildType: $buildType,
+                  externalParameters: {source: $source, subject: $subject},
+                  internalParameters: {},
+                  resolvedDependencies: [{uri: $source, digest: {gitCommit: $sha}}]
+                },
+                runDetails: {builder: {id: $builder}, metadata: {invocationId: $invocation}}
+              }' > "slsa-${key}.json"
+            cosign attest --yes --type slsaprovenance1 --predicate "slsa-${key}.json" "${artifact}"
+            for arch in amd64 arm64; do
+              cosign attest --yes --type spdxjson --predicate "sbom-${sbom_prefix}-linux-${arch}.spdx.json" "${artifact}"
+            done
+            cosign sign --yes "${artifact}"
+            cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" --output json "${artifact}" > "cosign-verification-${key}.json"
+            cosign verify-attestation --type slsaprovenance1 --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+            cosign verify-attestation --type spdxjson --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+          }
+          attest_artifact controller "${CONTROLLER_IMAGE}" "${CONTROLLER_DIGEST}" controller
+          attest_artifact model-router "${ROUTER_IMAGE}" "${ROUTER_DIGEST}" model-router
+          attest_artifact provider-package "${PACKAGE_IMAGE}" "${PACKAGE_DIGEST}" provider-package
+
+      - name: Attest controller SLSA provenance
+        if: steps.release_preflight.outputs.state != 'published'
+        id: controller_provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.CONTROLLER_IMAGE }}
+          subject-digest: ${{ steps.images.outputs.controller_digest }}
+          push-to-registry: true
+
+      - name: Attest model-router SLSA provenance
+        if: steps.release_preflight.outputs.state != 'published'
+        id: router_provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.ROUTER_IMAGE }}
+          subject-digest: ${{ steps.images.outputs.router_digest }}
+          push-to-registry: true
+
+      - name: Attest provider package SLSA provenance
+        if: steps.release_preflight.outputs.state != 'published'
+        id: package_provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.PACKAGE_IMAGE }}
+          subject-digest: ${{ steps.package.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest controller linux-amd64 SPDX SBOM
+        if: steps.release_preflight.outputs.state != 'published'
+        id: controller_amd64_sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.CONTROLLER_IMAGE }}
+          subject-digest: ${{ steps.images.outputs.controller_digest }}
+          sbom-path: bundle/sbom-controller-linux-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest controller linux-arm64 SPDX SBOM
+        if: steps.release_preflight.outputs.state != 'published'
+        id: controller_arm64_sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.CONTROLLER_IMAGE }}
+          subject-digest: ${{ steps.images.outputs.controller_digest }}
+          sbom-path: bundle/sbom-controller-linux-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Attest model-router linux-amd64 SPDX SBOM
+        if: steps.release_preflight.outputs.state != 'published'
+        id: router_amd64_sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.ROUTER_IMAGE }}
+          subject-digest: ${{ steps.images.outputs.router_digest }}
+          sbom-path: bundle/sbom-model-router-linux-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest model-router linux-arm64 SPDX SBOM
+        if: steps.release_preflight.outputs.state != 'published'
+        id: router_arm64_sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.ROUTER_IMAGE }}
+          subject-digest: ${{ steps.images.outputs.router_digest }}
+          sbom-path: bundle/sbom-model-router-linux-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Attest provider package linux-amd64 SPDX SBOM
+        if: steps.release_preflight.outputs.state != 'published'
+        id: package_amd64_sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.PACKAGE_IMAGE }}
+          subject-digest: ${{ steps.package.outputs.digest }}
+          sbom-path: bundle/sbom-provider-package-linux-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest provider package linux-arm64 SPDX SBOM
+        if: steps.release_preflight.outputs.state != 'published'
+        id: package_arm64_sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
+        with:
+          subject-name: ${{ env.PACKAGE_IMAGE }}
+          subject-digest: ${{ steps.package.outputs.digest }}
+          sbom-path: bundle/sbom-provider-package-linux-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Collect signed attestation bundles as release assets
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bundle/attestation-bundles
+          cp "${{ steps.controller_provenance.outputs.bundle-path }}" bundle/attestation-bundles/controller-slsa.sigstore.json
+          cp "${{ steps.router_provenance.outputs.bundle-path }}" bundle/attestation-bundles/model-router-slsa.sigstore.json
+          cp "${{ steps.package_provenance.outputs.bundle-path }}" bundle/attestation-bundles/provider-package-slsa.sigstore.json
+          cp "${{ steps.controller_amd64_sbom.outputs.bundle-path }}" bundle/attestation-bundles/controller-linux-amd64-spdx.sigstore.json
+          cp "${{ steps.controller_arm64_sbom.outputs.bundle-path }}" bundle/attestation-bundles/controller-linux-arm64-spdx.sigstore.json
+          cp "${{ steps.router_amd64_sbom.outputs.bundle-path }}" bundle/attestation-bundles/model-router-linux-amd64-spdx.sigstore.json
+          cp "${{ steps.router_arm64_sbom.outputs.bundle-path }}" bundle/attestation-bundles/model-router-linux-arm64-spdx.sigstore.json
+          cp "${{ steps.package_amd64_sbom.outputs.bundle-path }}" bundle/attestation-bundles/provider-package-linux-amd64-spdx.sigstore.json
+          cp "${{ steps.package_arm64_sbom.outputs.bundle-path }}" bundle/attestation-bundles/provider-package-linux-arm64-spdx.sigstore.json
+
+      - name: Verify authenticated and anonymous signature and attestation paths
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        working-directory: bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTROLLER_DIGEST: ${{ steps.images.outputs.controller_digest }}
+          ROUTER_DIGEST: ${{ steps.images.outputs.router_digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -euo pipefail
+          anonymous_docker_config="$(mktemp -d)"
           for artifact in \
             "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" \
             "${ROUTER_IMAGE}@${ROUTER_DIGEST}" \
             "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"; do
+            gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://slsa.dev/provenance/v1" >/dev/null
+            gh attestation verify "oci://${artifact}" --repo "${GITHUB_REPOSITORY}" --bundle-from-oci --cert-identity "${SIGNING_IDENTITY}" --cert-oidc-issuer "${SIGNING_ISSUER}" --source-ref "${GITHUB_REF}" --source-digest "${GITHUB_SHA}" --predicate-type "https://spdx.dev/Document" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type slsaprovenance1 --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
             DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type spdxjson --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
-          done
-          for image in \
-            "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" \
-            "${ROUTER_IMAGE}@${ROUTER_DIGEST}" \
-            "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"; do
-            DOCKER_CONFIG="${anonymous_docker_config}" docker pull --platform linux/amd64 "${image}" >/dev/null
-            DOCKER_CONFIG="${anonymous_docker_config}" docker pull --platform linux/arm64 "${image}" >/dev/null
+            DOCKER_CONFIG="${anonymous_docker_config}" docker pull --platform linux/amd64 "${artifact}" >/dev/null
+            DOCKER_CONFIG="${anonymous_docker_config}" docker pull --platform linux/arm64 "${artifact}" >/dev/null
           done
 
-      - name: Publish digest manifest and GitHub release
+      - name: Assemble, upload, and hash-verify the exact draft asset set
+        if: steps.release_preflight.outputs.state != 'published'
+        shell: bash
+        working-directory: bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONTROLLER_DIGEST: ${{ steps.images.outputs.controller_digest }}
+          ROUTER_DIGEST: ${{ steps.images.outputs.router_digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+          HANDOFF_ARTIFACT_ID: ${{ steps.handoff.outputs.artifact_id }}
+          HANDOFF_DIGEST: ${{ steps.handoff.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "${HANDOFF_ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${HANDOFF_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "${PACKAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "${CONTROLLER_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "${ROUTER_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cat > release-digests.txt <<EOF
+          release-tag=${GITHUB_REF_NAME}
+          release-ref=${GITHUB_REF}
+          source-commit=${GITHUB_SHA}
+          handoff-artifact-id=${HANDOFF_ARTIFACT_ID}
+          handoff-digest=${HANDOFF_DIGEST}
+          package-ref=${PACKAGE_IMAGE}@${PACKAGE_DIGEST}
+          controller-ref=${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}
+          model-router-ref=${ROUTER_IMAGE}@${ROUTER_DIGEST}
+          signing-identity=${SIGNING_IDENTITY}
+          signing-issuer=${SIGNING_ISSUER}
+          EOF
+          expected_evidence=(
+            "release-tag=${GITHUB_REF_NAME}"
+            "release-ref=${GITHUB_REF}"
+            "source-commit=${GITHUB_SHA}"
+            "handoff-artifact-id=${HANDOFF_ARTIFACT_ID}"
+            "handoff-digest=${HANDOFF_DIGEST}"
+            "package-ref=${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"
+            "controller-ref=${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}"
+            "model-router-ref=${ROUTER_IMAGE}@${ROUTER_DIGEST}"
+            "signing-identity=${SIGNING_IDENTITY}"
+            "signing-issuer=${SIGNING_ISSUER}"
+          )
+          mapfile -t actual_evidence < release-digests.txt
+          test "${#actual_evidence[@]}" -eq "${#expected_evidence[@]}"
+          for index in "${!expected_evidence[@]}"; do
+            test "${actual_evidence[${index}]}" = "${expected_evidence[${index}]}"
+          done
+          source_assets=(
+            "${RELEASE_DIR}"/*.xpkg
+            release-digests.txt BUILD-SHA256SUMS
+            sbom-*.spdx.json trivy-*.sarif cosign-verification-*.json
+            attestation-bundles/*.json
+          )
+          expected_release_assets() {
+            printf '%s\n' \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg" \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg" \
+              BUILD-SHA256SUMS SHA256SUMS release-digests.txt
+            for component in controller model-router provider-package; do
+              printf '%s\n' \
+                "cosign-verification-${component}.json" \
+                "${component}-slsa.sigstore.json"
+              for arch in amd64 arm64; do
+                printf '%s\n' \
+                  "sbom-${component}-linux-${arch}.spdx.json" \
+                  "trivy-${component}-linux-${arch}.sarif" \
+                  "${component}-linux-${arch}-spdx.sigstore.json"
+              done
+            done
+          }
+          asset_digest_snapshot() {
+            jq -ce '
+              [.assets[] | {name, digest}] | sort_by(.name) |
+              if all(.[];
+                ((.name | type) == "string") and
+                ((.digest | type) == "string") and
+                (.digest | test("^sha256:[0-9a-f]{64}$"))
+              ) then . else error("release assets are missing GitHub SHA-256 digests") end
+            ' <<<"$1"
+          }
+          expected="$(expected_release_assets | LC_ALL=C sort)"
+          release_assets="release-assets"
+          mkdir "${release_assets}"
+          for source_asset in "${source_assets[@]}"; do
+            asset_name="${source_asset##*/}"
+            test ! -e "${release_assets}/${asset_name}"
+            cp -- "${source_asset}" "${release_assets}/${asset_name}"
+          done
+          mapfile -t checksum_names < <(expected_release_assets | grep -Fvx SHA256SUMS | LC_ALL=C sort)
+          : > "${release_assets}/SHA256SUMS"
+          for asset_name in "${checksum_names[@]}"; do
+            digest="$(sha256sum "${release_assets}/${asset_name}" | awk '{print $1}')"
+            printf '%s  %s\n' "${digest}" "${asset_name}" >> "${release_assets}/SHA256SUMS"
+          done
+          local_assets="$(find "${release_assets}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          test "${local_assets}" = "${expected}"
+          (cd "${release_assets}" && sha256sum --check --strict SHA256SUMS)
+
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          jq -e --arg tag "${GITHUB_REF_NAME}" '.tag_name == $tag and .draft == true and (.immutable // false) == false' <<<"${release_json}" >/dev/null
+          gh release upload "${GITHUB_REF_NAME}" --clobber "${release_assets}"/*
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+          test "${actual}" = "${expected}"
+          asset_snapshot="$(asset_digest_snapshot "${release_json}")"
+
+          downloaded_assets="$(mktemp -d)"
+          gh release download "${GITHUB_REF_NAME}" --dir "${downloaded_assets}"
+          if find "${downloaded_assets}" -mindepth 1 ! -type f -print -quit | grep -q .; then
+            echo 'draft release contains a non-regular asset' >&2
+            exit 1
+          fi
+          downloaded="$(find "${downloaded_assets}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          test "${downloaded}" = "${expected}"
+          cmp "${release_assets}/SHA256SUMS" "${downloaded_assets}/SHA256SUMS"
+          (cd "${downloaded_assets}" && sha256sum --check --strict SHA256SUMS)
+          python3 - "${downloaded_assets}" "${asset_snapshot}" <<'PY'
+          import hashlib, json, pathlib, stat, sys
+
+          root = pathlib.Path(sys.argv[1])
+          api_digests = {item["name"]: item["digest"] for item in json.loads(sys.argv[2])}
+          files = {path.name for path in root.iterdir() if path.is_file()}
+          if set(api_digests) != files:
+              raise SystemExit("GitHub asset digest set does not match downloaded assets")
+          for name in files:
+              path = root / name
+              if not stat.S_ISREG(path.lstat().st_mode):
+                  raise SystemExit(f"release asset is not a regular file: {name!r}")
+              hasher = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+              if api_digests[name] != f"sha256:{hasher.hexdigest()}":
+                  raise SystemExit(f"GitHub asset digest mismatch: {name!r}")
+          PY
+
+      - name: Idempotently promote verified digests and immediately publish
+        if: steps.release_preflight.outputs.state != 'published'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
-          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ steps.images.outputs.controller_digest }}
+          ROUTER_DIGEST: ${{ steps.images.outputs.router_digest }}
           PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
-          CONTROLLER_AMD64_DIGEST: ${{ steps.platforms.outputs.controller_amd64 }}
-          CONTROLLER_ARM64_DIGEST: ${{ steps.platforms.outputs.controller_arm64 }}
-          ROUTER_AMD64_DIGEST: ${{ steps.platforms.outputs.router_amd64 }}
-          ROUTER_ARM64_DIGEST: ${{ steps.platforms.outputs.router_arm64 }}
         run: |
           set -euo pipefail
-          cat > release-digests.txt <<EOF
-          ${PACKAGE_IMAGE}@${PACKAGE_DIGEST}
-          ${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}
-          ${CONTROLLER_IMAGE}@${CONTROLLER_AMD64_DIGEST} linux/amd64
-          ${CONTROLLER_IMAGE}@${CONTROLLER_ARM64_DIGEST} linux/arm64
-          ${ROUTER_IMAGE}@${ROUTER_DIGEST}
-          ${ROUTER_IMAGE}@${ROUTER_AMD64_DIGEST} linux/amd64
-          ${ROUTER_IMAGE}@${ROUTER_ARM64_DIGEST} linux/arm64
-          keyless-identity=${SIGNING_IDENTITY}
-          issuer=${SIGNING_ISSUER}
-          EOF
-          sha256sum "${RELEASE_DIR}"/provider-runpod-*.xpkg sbom-*.spdx.json trivy-*.sarif cosign-verification-*.json > SHA256SUMS
-          gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes \
-            "${RELEASE_DIR}"/provider-runpod-*.xpkg \
-            release-digests.txt SHA256SUMS \
-            sbom-*.spdx.json trivy-*.sarif cosign-verification-*.json
+          expected_release_assets() {
+            printf '%s\n' \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg" \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg" \
+              BUILD-SHA256SUMS SHA256SUMS release-digests.txt
+            for component in controller model-router provider-package; do
+              printf '%s\n' \
+                "cosign-verification-${component}.json" \
+                "${component}-slsa.sigstore.json"
+              for arch in amd64 arm64; do
+                printf '%s\n' \
+                  "sbom-${component}-linux-${arch}.spdx.json" \
+                  "trivy-${component}-linux-${arch}.sarif" \
+                  "${component}-linux-${arch}-spdx.sigstore.json"
+              done
+            done
+          }
+          asset_digest_snapshot() {
+            jq -ce '
+              [.assets[] | {name, digest}] | sort_by(.name) |
+              if all(.[];
+                ((.name | type) == "string") and
+                ((.digest | type) == "string") and
+                (.digest | test("^sha256:[0-9a-f]{64}$"))
+              ) then . else error("release assets are missing GitHub SHA-256 digests") end
+            ' <<<"$1"
+          }
+          canonical_release_body() {
+            printf '<!-- provider-runpod automated release -->\n\nAutomated immutable release %s for commit %s.\n\nWorkflow run: %s/%s/actions/runs/%s' \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+          }
+          canonical_body="$(canonical_release_body)"
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+            .tag_name == $tag and .name == $tag and .body == $body and
+            .author.login == "github-actions[bot]" and .author.type == "Bot" and
+            .draft == true and .prerelease == false and (.immutable // false) == false
+          ' <<<"${release_json}" >/dev/null
+          expected="$(expected_release_assets | LC_ALL=C sort)"
+          actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+          test "${actual}" = "${expected}"
+
+          anonymous_docker_config="$(mktemp -d)"
+          for artifact in \
+            "${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}" \
+            "${ROUTER_IMAGE}@${ROUTER_DIGEST}" \
+            "${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"; do
+            DOCKER_CONFIG="${anonymous_docker_config}" cosign verify --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+            DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type slsaprovenance1 --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+            DOCKER_CONFIG="${anonymous_docker_config}" cosign verify-attestation --type spdxjson --certificate-identity "${SIGNING_IDENTITY}" --certificate-oidc-issuer "${SIGNING_ISSUER}" "${artifact}" >/dev/null
+          done
+          resolve_tag_commit() {
+            local object type sha depth=0
+            object="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")"
+            type="$(jq -r .object.type <<<"${object}")"
+            sha="$(jq -r .object.sha <<<"${object}")"
+            while test "${type}" = tag; do
+              depth=$((depth + 1)); test "${depth}" -le 5
+              object="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "/repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
+              type="$(jq -r .object.type <<<"${object}")"
+              sha="$(jq -r .object.sha <<<"${object}")"
+            done
+            test "${type}" = commit
+            printf '%s' "${sha}"
+          }
+          test "$(resolve_tag_commit)" = "${GITHUB_SHA}"
+          tagged_digest() {
+            local package="$1" tag="$2"
+            local matches=()
+            mapfile -t matches < <(gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/${package}/versions?per_page=100" \
+              --jq ".[] | select(.metadata.container.tags | index(\"${tag}\")) | .name")
+            test "${#matches[@]}" -le 1
+            if test "${#matches[@]}" -eq 1; then
+              printf '%s' "${matches[0]}"
+            fi
+          }
+          ensure_tag() {
+            local image="$1" package="$2" digest="$3" tag="$4"
+            local existing actual
+            existing="$(tagged_digest "${package}" "${tag}")"
+            if [[ "${existing}" =~ ^[0-9a-f]{64}$ ]]; then
+              existing="sha256:${existing}"
+            fi
+            if test -n "${existing}"; then
+              test "${existing}" = "${digest}"
+            else
+              test -z "$(tagged_digest "${package}" "${tag}")"
+              docker buildx imagetools create --prefer-index=false --tag "${image}:${tag}" "${image}@${digest}"
+            fi
+            actual="$(docker buildx imagetools inspect "${image}:${tag}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            test "${actual}" = "${digest}"
+          }
+          registry_tag_digest() {
+            local image="$1" tag="$2" actual
+            if actual="$(docker buildx imagetools inspect "${image}:${tag}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"')"; then
+              [[ "${actual}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              printf '%s' "${actual}"
+            fi
+          }
+          preflight_tag() {
+            local image="$1" package="$2" digest="$3" tag="$4"
+            local api_digest registry_digest
+            docker buildx imagetools inspect "${image}@${digest}" >/dev/null
+            api_digest="$(tagged_digest "${package}" "${tag}")"
+            if [[ "${api_digest}" =~ ^[0-9a-f]{64}$ ]]; then
+              api_digest="sha256:${api_digest}"
+            fi
+            registry_digest="$(registry_tag_digest "${image}" "${tag}")"
+            if test -n "${api_digest}" || test -n "${registry_digest}"; then
+              test -n "${api_digest}"
+              test -n "${registry_digest}"
+              test "${api_digest}" = "${digest}"
+              test "${registry_digest}" = "${digest}"
+            fi
+          }
+
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+            .tag_name == $tag and .name == $tag and .body == $body and
+            .author.login == "github-actions[bot]" and .author.type == "Bot" and
+            .draft == true and .prerelease == false and (.immutable // false) == false
+          ' <<<"${release_json}" >/dev/null
+          actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+          test "${actual}" = "${expected}"
+          asset_snapshot="$(asset_digest_snapshot "${release_json}")"
+          downloaded_assets="$(mktemp -d)"
+          gh release download "${GITHUB_REF_NAME}" --dir "${downloaded_assets}"
+          if find "${downloaded_assets}" -mindepth 1 ! -type f -print -quit | grep -q .; then
+            echo 'draft release contains a non-regular asset' >&2
+            exit 1
+          fi
+          downloaded="$(find "${downloaded_assets}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          test "${downloaded}" = "${expected}"
+          cmp bundle/release-assets/SHA256SUMS "${downloaded_assets}/SHA256SUMS"
+          (cd "${downloaded_assets}" && sha256sum --check --strict SHA256SUMS)
+          python3 - "${downloaded_assets}" "${asset_snapshot}" <<'PY'
+          import hashlib, json, pathlib, stat, sys
+
+          root = pathlib.Path(sys.argv[1])
+          api_digests = {item["name"]: item["digest"] for item in json.loads(sys.argv[2])}
+          files = {path.name for path in root.iterdir() if path.is_file()}
+          if set(api_digests) != files:
+              raise SystemExit("GitHub asset digest set does not match downloaded assets")
+          for name in files:
+              path = root / name
+              if not stat.S_ISREG(path.lstat().st_mode):
+                  raise SystemExit(f"release asset is not a regular file: {name!r}")
+              hasher = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+              if api_digests[name] != f"sha256:{hasher.hexdigest()}":
+                  raise SystemExit(f"GitHub asset digest mismatch: {name!r}")
+          PY
+          test "$(resolve_tag_commit)" = "${GITHUB_SHA}"
+
+          for tag in "${GITHUB_REF_NAME}" "sha-${GITHUB_SHA}"; do
+            preflight_tag "${CONTROLLER_IMAGE}" provider-runpod-controller "${CONTROLLER_DIGEST}" "${tag}"
+            preflight_tag "${ROUTER_IMAGE}" provider-runpod-model-router "${ROUTER_DIGEST}" "${tag}"
+            preflight_tag "${PACKAGE_IMAGE}" provider-runpod "${PACKAGE_DIGEST}" "${tag}"
+          done
+          for tag in "${GITHUB_REF_NAME}" "sha-${GITHUB_SHA}"; do
+            ensure_tag "${CONTROLLER_IMAGE}" provider-runpod-controller "${CONTROLLER_DIGEST}" "${tag}"
+            ensure_tag "${ROUTER_IMAGE}" provider-runpod-model-router "${ROUTER_DIGEST}" "${tag}"
+            ensure_tag "${PACKAGE_IMAGE}" provider-runpod "${PACKAGE_DIGEST}" "${tag}"
+          done
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+            .tag_name == $tag and .name == $tag and .body == $body and
+            .author.login == "github-actions[bot]" and .author.type == "Bot" and
+            .draft == true and .prerelease == false and (.immutable // false) == false
+          ' <<<"${release_json}" >/dev/null
+          actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
+          test "${actual}" = "${expected}"
+          test "$(asset_digest_snapshot "${release_json}")" = "${asset_snapshot}"
+          gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          published="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+            .tag_name == $tag and .name == $tag and .body == $body and
+            .author.login == "github-actions[bot]" and .author.type == "Bot" and
+            .draft == false and .prerelease == false and .immutable == true
+          ' <<<"${published}" >/dev/null
+          test "$(resolve_tag_commit)" = "${GITHUB_SHA}"
+
+      - name: Final immutable release and tag assertion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_HANDOFF_ARTIFACT_ID: ${{ steps.handoff.outputs.artifact_id }}
+          EXPECTED_HANDOFF_DIGEST: ${{ steps.handoff.outputs.digest }}
+          EXPECTED_PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+          EXPECTED_CONTROLLER_DIGEST: ${{ steps.images.outputs.controller_digest }}
+          EXPECTED_ROUTER_DIGEST: ${{ steps.images.outputs.router_digest }}
+        run: |
+          set -euo pipefail
+          canonical_release_body() {
+            printf '<!-- provider-runpod automated release -->\n\nAutomated immutable release %s for commit %s.\n\nWorkflow run: %s/%s/actions/runs/%s' \
+              "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+          }
+          canonical_body="$(canonical_release_body)"
+          published="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")"
+          jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
+            .tag_name == $tag and .name == $tag and .body == $body and
+            .author.login == "github-actions[bot]" and .author.type == "Bot" and
+            .draft == false and .prerelease == false and .immutable == true
+          ' <<<"${published}" >/dev/null
+          expected_release_assets() {
+            printf '%s\n' \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-amd64.xpkg" \
+              "provider-runpod-${GITHUB_REF_NAME}-linux-arm64.xpkg" \
+              BUILD-SHA256SUMS SHA256SUMS release-digests.txt
+            for component in controller model-router provider-package; do
+              printf '%s\n' \
+                "cosign-verification-${component}.json" \
+                "${component}-slsa.sigstore.json"
+              for arch in amd64 arm64; do
+                printf '%s\n' \
+                  "sbom-${component}-linux-${arch}.spdx.json" \
+                  "trivy-${component}-linux-${arch}.sarif" \
+                  "${component}-linux-${arch}-spdx.sigstore.json"
+              done
+            done
+          }
+          asset_digest_snapshot() {
+            jq -ce '
+              [.assets[] | {name, digest}] | sort_by(.name) |
+              if all(.[];
+                ((.name | type) == "string") and
+                ((.digest | type) == "string") and
+                (.digest | test("^sha256:[0-9a-f]{64}$"))
+              ) then . else error("release assets are missing GitHub SHA-256 digests") end
+            ' <<<"$1"
+          }
+          validate_release_digests() {
+            python3 - "$1" <<'PY'
+          import os, pathlib, re, sys
+
+          path = pathlib.Path(sys.argv[1])
+          try:
+              text = path.read_bytes().decode("utf-8")
+          except UnicodeDecodeError as error:
+              raise SystemExit("release-digests.txt is not valid UTF-8") from error
+          if "\r" in text or "\0" in text or not text.endswith("\n"):
+              raise SystemExit("release-digests.txt has invalid line encoding")
+          lines = text[:-1].split("\n")
+          keys = [
+              "release-tag",
+              "release-ref",
+              "source-commit",
+              "handoff-artifact-id",
+              "handoff-digest",
+              "package-ref",
+              "controller-ref",
+              "model-router-ref",
+              "signing-identity",
+              "signing-issuer",
+          ]
+          if len(lines) != len(keys):
+              raise SystemExit("release-digests.txt has missing or extra lines")
+          values = {}
+          for expected_key, line in zip(keys, lines, strict=True):
+              key, separator, value = line.partition("=")
+              if separator != "=" or key != expected_key or not value or key in values:
+                  raise SystemExit(f"invalid release-digests.txt line: {line!r}")
+              values[key] = value
+
+          expected = {
+              "release-tag": os.environ["GITHUB_REF_NAME"],
+              "release-ref": os.environ["GITHUB_REF"],
+              "source-commit": os.environ["GITHUB_SHA"],
+              "signing-identity": os.environ["SIGNING_IDENTITY"],
+              "signing-issuer": os.environ["SIGNING_ISSUER"],
+          }
+          for key, value in expected.items():
+              if values[key] != value:
+                  raise SystemExit(f"release evidence mismatch for {key}")
+          if not re.fullmatch(r"[1-9][0-9]*", values["handoff-artifact-id"]):
+              raise SystemExit("invalid handoff artifact ID in release evidence")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", values["handoff-digest"]):
+              raise SystemExit("invalid handoff digest in release evidence")
+          images = {
+              "package-ref": os.environ["PACKAGE_IMAGE"],
+              "controller-ref": os.environ["CONTROLLER_IMAGE"],
+              "model-router-ref": os.environ["ROUTER_IMAGE"],
+          }
+          for key, image in images.items():
+              if re.fullmatch(re.escape(image) + r"@sha256:[0-9a-f]{64}", values[key]) is None:
+                  raise SystemExit(f"invalid final image reference for {key}")
+
+          optional_values = [
+              os.environ.get("EXPECTED_HANDOFF_ARTIFACT_ID", ""),
+              os.environ.get("EXPECTED_HANDOFF_DIGEST", ""),
+              os.environ.get("EXPECTED_PACKAGE_DIGEST", ""),
+              os.environ.get("EXPECTED_CONTROLLER_DIGEST", ""),
+              os.environ.get("EXPECTED_ROUTER_DIGEST", ""),
+          ]
+          if any(optional_values) != all(optional_values):
+              raise SystemExit("incomplete local release evidence expectations")
+          if all(optional_values):
+              handoff_id, handoff_digest, package_digest, controller_digest, router_digest = optional_values
+              exact_local = {
+                  "handoff-artifact-id": handoff_id,
+                  "handoff-digest": handoff_digest,
+                  "package-ref": f'{images["package-ref"]}@{package_digest}',
+                  "controller-ref": f'{images["controller-ref"]}@{controller_digest}',
+                  "model-router-ref": f'{images["model-router-ref"]}@{router_digest}',
+              }
+              for key, value in exact_local.items():
+                  if values[key] != value:
+                      raise SystemExit(f"local release evidence mismatch for {key}")
+          PY
+          }
+          expected="$(expected_release_assets | LC_ALL=C sort)"
+          actual_assets="$(jq -r '.assets[].name' <<<"${published}" | LC_ALL=C sort)"
+          test "${actual_assets}" = "${expected}"
+          asset_snapshot="$(asset_digest_snapshot "${published}")"
+          object="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}")"
+          type="$(jq -r .object.type <<<"${object}")"
+          sha="$(jq -r .object.sha <<<"${object}")"
+          depth=0
+          while test "${type}" = tag; do
+            depth=$((depth + 1)); test "${depth}" -le 5
+            object="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "/repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
+            type="$(jq -r .object.type <<<"${object}")"
+            sha="$(jq -r .object.sha <<<"${object}")"
+          done
+          test "${type}" = commit
+          test "${sha}" = "${GITHUB_SHA}"
+          release_dir="$(mktemp -d)"
+          gh release download "${GITHUB_REF_NAME}" --dir "${release_dir}"
+          if find "${release_dir}" -mindepth 1 ! -type f -print -quit | grep -q .; then
+            echo 'published release contains a non-regular asset' >&2
+            exit 1
+          fi
+          downloaded="$(find "${release_dir}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          test "${downloaded}" = "${expected}"
+          python3 - "${release_dir}" "${asset_snapshot}" <<'PY'
+          import hashlib, json, pathlib, re, stat, sys
+
+          root = pathlib.Path(sys.argv[1])
+          files = {path.name for path in root.iterdir() if path.is_file()}
+          api_digests = {item["name"]: item["digest"] for item in json.loads(sys.argv[2])}
+          if set(api_digests) != files:
+              raise SystemExit("GitHub asset digest set does not match downloaded assets")
+          actual_digests = {}
+          for name in files:
+              path = root / name
+              mode = path.lstat().st_mode
+              if not stat.S_ISREG(mode):
+                  raise SystemExit(f"release asset is not a regular file: {name!r}")
+              hasher = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+              actual_digests[name] = hasher.hexdigest()
+              if api_digests[name] != f"sha256:{actual_digests[name]}":
+                  raise SystemExit(f"GitHub asset digest mismatch: {name!r}")
+          expected = files - {"SHA256SUMS"}
+          checksums = {}
+          for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if match is None:
+                  raise SystemExit(f"invalid SHA256SUMS line: {line!r}")
+              digest, name = match.groups()
+              if name == "SHA256SUMS" or name in checksums:
+                  raise SystemExit(f"invalid or duplicate checksum name: {name!r}")
+              checksums[name] = digest
+          if set(checksums) != expected:
+              raise SystemExit("SHA256SUMS does not bind the exact immutable asset set")
+          for name, expected_digest in checksums.items():
+              if actual_digests[name] != expected_digest:
+                  raise SystemExit(f"release asset digest mismatch: {name!r}")
+          PY
+          (cd "${release_dir}" && sha256sum --check --strict SHA256SUMS)
+          validate_release_digests "${release_dir}/release-digests.txt"
+          anonymous_docker_config="$(mktemp -d)"
+          mapfile -t evidence_lines < "${release_dir}/release-digests.txt"
+          for artifact in \
+            "${evidence_lines[5]#package-ref=}" \
+            "${evidence_lines[6]#controller-ref=}" \
+            "${evidence_lines[7]#model-router-ref=}"; do
+            image="${artifact%@*}"
+            digest="${artifact#*@}"
+            for tag in "${GITHUB_REF_NAME}" "sha-${GITHUB_SHA}"; do
+              actual="$(DOCKER_CONFIG="${anonymous_docker_config}" docker buildx imagetools inspect "${image}:${tag}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+              test "${actual}" = "${digest}"
+            done
+          done

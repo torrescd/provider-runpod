@@ -15,7 +15,7 @@ source, schema, generated code, or fixtures are used.
 | API | Purpose |
 |---|---|
 | `Template.serverless.runpod.crossplane.io/v1alpha1` | Private Serverless template using an OCI digest |
-| `Endpoint.serverless.runpod.crossplane.io/v1alpha1` | GPU endpoint with `workersMin=0`, `workersMax<=1`, and hard TTL |
+| `Endpoint.serverless.runpod.crossplane.io/v1alpha1` | GPU endpoint with exactly one bounded worker and a hard TTL |
 | `EndpointCheck.verification.runpod.crossplane.io/v1alpha1` | Inference-only readiness and routing gate |
 
 Pods and network volumes are deliberately deferred. Imperative actions,
@@ -32,7 +32,7 @@ implemented.
   `runpod.crossplane.io/credential-purpose` label; the provider accepts only
   `management` and model-router accepts only `inference`.
 - The provider and model-router are separate processes and service accounts.
-  The shipped RBAC keeps the management Secret in `crossplane-system` and the
+  The shipped RBAC keeps the management Secret in `runpod-credentials` and the
   inference Secret in `runpod-system`, each restricted by `resourceNames`.
 - EndpointCheck reconciliation runs inside model-router's namespace-scoped
   manager. model-router has no ProviderConfig RBAC and never holds the
@@ -40,7 +40,20 @@ implemented.
 - Template images must be `repository@sha256:<64 lowercase hex>` and must pass
   the shipped fail-closed signature, SLSA provenance, and SPDX admission
   contract before resource creation.
+- Templates require `volumeInGb: 0`; the provider never exposes or sends a
+  persistent mount path, avoiding RunPod's omitted-field defaults of 20 GiB and
+  `/workspace`.
+- Endpoints require and send `workersMin: 1`, `workersMax: 1`, `flashboot: false`, an explicit
+  data-center allowlist, require an explicit per-worker hourly cost ceiling,
+  validate the continuously provisioned Secure Cloud worker, clear that proof
+  on any empty-worker observation, and refuse external
+  Create/Update after their hard deadline.
+- v0.1 does not support external-name adoption or direct Endpoint/Template IDs;
+  every binding originates from provider create or exact UID-scoped recovery.
 - Endpoint and route lifetimes are hard-bounded to 24 hours.
+
+Crossplane v2.4 or newer is required for namespaced v2 managed resources and
+the package's `safe-start` capability.
 
 See [security](docs/security.md), [RBAC](docs/rbac.md), [API sources](docs/api-sources.md), the
 [Terraform migration guide](docs/terraform-migration.md), and the

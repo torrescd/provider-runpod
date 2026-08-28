@@ -31,7 +31,7 @@ func TestVerifyHealthModelAndToolCall(t *testing.T) {
 			if body["model"] != "org/model" {
 				t.Errorf("model=%v", body["model"])
 			}
-			_, _ = io.WriteString(w, `{"choices":[{"message":{"tool_calls":[{"function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}}]}`)
+			_, _ = io.WriteString(w, `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"call_ready","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -70,8 +70,43 @@ func TestProductionTransportHonorsProxyEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	transport, ok := c.httpClient.Transport.(*http.Transport)
-	if !ok || transport.Proxy == nil {
-		t.Fatal("transport has no environment proxy function")
+	if !ok || transport.Proxy == nil || transport.ResponseHeaderTimeout != time.Second || transport.MaxResponseHeaderBytes != 64<<10 {
+		t.Fatalf("transport is not proxy/header bounded: %+v", transport)
+	}
+}
+
+func TestVerifyRequiresExactReadinessToolResponse(t *testing.T) {
+	cases := map[string]string{
+		"missing finish reason": `{"choices":[{"message":{"tool_calls":[{"id":"call_ready","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}}]}`,
+		"two choices":           `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"call_ready","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}},{"finish_reason":"tool_calls","message":{"tool_calls":[]}}]}`,
+		"two calls":             `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"call_ready","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}},{"id":"call_two","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}}]}`,
+		"wrong outer type":      `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"call_ready","type":"custom","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}}]}`,
+		"unsafe call ID":        `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"../../call","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\"}"}}]}}]}`,
+		"unknown argument":      `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"call_ready","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\",\"extra\":true}"}}]}}]}`,
+		"duplicate argument":    `{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"call_ready","type":"function","function":{"name":"readiness_probe","arguments":"{\"token\":\"ready\",\"token\":\"ready\"}"}}]}}]}`,
+	}
+	for name, toolResponse := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/health"):
+					_, _ = io.WriteString(w, `{}`)
+				case strings.HasSuffix(r.URL.Path, "/models"):
+					_, _ = io.WriteString(w, `{"data":[{"id":"org/model"}]}`)
+				default:
+					_, _ = io.WriteString(w, toolResponse)
+				}
+			}))
+			defer server.Close()
+			c, err := New("endpoint_1", []byte("endpoint-token"), time.Second, WithBaseURLForTesting(server.URL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := c.Verify(context.Background(), "org/model")
+			if err == nil || result.ToolCallVerified {
+				t.Fatalf("unsafe tool response admitted: result=%+v err=%v", result, err)
+			}
+		})
 	}
 }
 
@@ -95,5 +130,13 @@ func TestInferenceCredentialNeverFollowsRedirect(t *testing.T) {
 	}
 	if redirected {
 		t.Fatal("inference credential followed redirect to a second origin")
+	}
+}
+
+func TestInferenceTokenRejectsSurroundingWhitespace(t *testing.T) {
+	for _, token := range []string{" endpoint-token", "endpoint-token ", "\tendpoint-token"} {
+		if _, err := New("endpoint_1", []byte(token), time.Second); err == nil {
+			t.Fatalf("non-canonical inference token %q was accepted", token)
+		}
 	}
 }
