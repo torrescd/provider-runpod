@@ -556,7 +556,15 @@ jobs:
             canonical_body="$(canonical_release_body)"
             gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --draft \
               --title "${GITHUB_REF_NAME}" --notes "${canonical_body}"
-            release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
+            release_json=
+            for _ in $(seq 1 30); do
+              if candidate="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end' 2>/dev/null)"; then
+                release_json="${candidate}"
+                break
+              fi
+              sleep 2
+            done
+            test -n "${release_json}"
             jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
               .tag_name == $tag and .name == $tag and .body == $body and
               .author.login == "github-actions[bot]" and .author.type == "Bot" and
