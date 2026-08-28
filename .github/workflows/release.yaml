@@ -502,9 +502,11 @@ jobs:
               "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
           }
 
-          # The tag endpoint excludes drafts; filter the collection so reruns can adopt our draft.
-          if release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end' 2>/dev/null)"; then
-            jq -e --arg tag "${GITHUB_REF_NAME}" '.tag_name == $tag and ((.draft == true and (.immutable // false) == false) or (.draft == false and .immutable == true))' <<<"${release_json}" >/dev/null
+          # Immutable draft releases may receive a temporary untagged-* lookup
+          # tag until publication. Adopt only the uniquely named draft; the
+          # canonical body and bot author are validated immediately below.
+          if release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end' 2>/dev/null)"; then
+            jq -e --arg tag "${GITHUB_REF_NAME}" '((.draft == true and .name == $tag and (.immutable // false) == false) or (.draft == false and .tag_name == $tag and .immutable == true))' <<<"${release_json}" >/dev/null
             canonical_body="$(canonical_release_body)"
             if test "$(jq -r .draft <<<"${release_json}")" = true; then
               jq -e '.author.login == "github-actions[bot]" and .author.type == "Bot"' <<<"${release_json}" >/dev/null
@@ -515,9 +517,9 @@ jobs:
                 "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
                 -f "name=${GITHUB_REF_NAME}" -f "body=${canonical_body}" \
                 -F draft=true -F prerelease=false >/dev/null
-              release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
+              release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end')"
               jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
-                .tag_name == $tag and .name == $tag and .body == $body and
+                .name == $tag and .body == $body and
                 .author.login == "github-actions[bot]" and .author.type == "Bot" and
                 .draft == true and .prerelease == false and (.immutable // false) == false
               ' <<<"${release_json}" >/dev/null
@@ -558,7 +560,7 @@ jobs:
               --title "${GITHUB_REF_NAME}" --notes "${canonical_body}"
             release_json=
             for _ in $(seq 1 30); do
-              if candidate="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end' 2>/dev/null)"; then
+              if candidate="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end' 2>/dev/null)"; then
                 release_json="${candidate}"
                 break
               fi
@@ -566,7 +568,7 @@ jobs:
             done
             test -n "${release_json}"
             jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
-              .tag_name == $tag and .name == $tag and .body == $body and
+              .name == $tag and .body == $body and
               .author.login == "github-actions[bot]" and .author.type == "Bot" and
               .draft == true and .prerelease == false and (.immutable // false) == false
             ' <<<"${release_json}" >/dev/null
@@ -1010,16 +1012,18 @@ jobs:
           test "${local_assets}" = "${expected}"
           (cd "${release_assets}" && sha256sum --check --strict SHA256SUMS)
 
-          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
-          jq -e --arg tag "${GITHUB_REF_NAME}" '.tag_name == $tag and .draft == true and (.immutable // false) == false' <<<"${release_json}" >/dev/null
-          gh release upload "${GITHUB_REF_NAME}" --clobber "${release_assets}"/*
-          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end')"
+          jq -e --arg tag "${GITHUB_REF_NAME}" '.name == $tag and .draft == true and (.immutable // false) == false' <<<"${release_json}" >/dev/null
+          release_lookup_tag="$(jq -er '.tag_name | select(type == "string" and length > 0)' <<<"${release_json}")"
+          gh release upload "${release_lookup_tag}" --clobber "${release_assets}"/*
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end')"
           actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
           test "${actual}" = "${expected}"
           asset_snapshot="$(asset_digest_snapshot "${release_json}")"
 
           downloaded_assets="$(mktemp -d)"
-          gh release download "${GITHUB_REF_NAME}" --dir "${downloaded_assets}"
+          release_lookup_tag="$(jq -er '.tag_name | select(type == "string" and length > 0)' <<<"${release_json}")"
+          gh release download "${release_lookup_tag}" --dir "${downloaded_assets}"
           if find "${downloaded_assets}" -mindepth 1 ! -type f -print -quit | grep -q .; then
             echo 'draft release contains a non-regular asset' >&2
             exit 1
@@ -1090,9 +1094,9 @@ jobs:
               "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
           }
           canonical_body="$(canonical_release_body)"
-          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end')"
           jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
-            .tag_name == $tag and .name == $tag and .body == $body and
+            .name == $tag and .body == $body and
             .author.login == "github-actions[bot]" and .author.type == "Bot" and
             .draft == true and .prerelease == false and (.immutable // false) == false
           ' <<<"${release_json}" >/dev/null
@@ -1177,9 +1181,9 @@ jobs:
             fi
           }
 
-          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end')"
           jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
-            .tag_name == $tag and .name == $tag and .body == $body and
+            .name == $tag and .body == $body and
             .author.login == "github-actions[bot]" and .author.type == "Bot" and
             .draft == true and .prerelease == false and (.immutable // false) == false
           ' <<<"${release_json}" >/dev/null
@@ -1187,7 +1191,8 @@ jobs:
           test "${actual}" = "${expected}"
           asset_snapshot="$(asset_digest_snapshot "${release_json}")"
           downloaded_assets="$(mktemp -d)"
-          gh release download "${GITHUB_REF_NAME}" --dir "${downloaded_assets}"
+          release_lookup_tag="$(jq -er '.tag_name | select(type == "string" and length > 0)' <<<"${release_json}")"
+          gh release download "${release_lookup_tag}" --dir "${downloaded_assets}"
           if find "${downloaded_assets}" -mindepth 1 ! -type f -print -quit | grep -q .; then
             echo 'draft release contains a non-regular asset' >&2
             exit 1
@@ -1227,16 +1232,17 @@ jobs:
             ensure_tag "${ROUTER_IMAGE}" provider-runpod-model-router "${ROUTER_DIGEST}" "${tag}"
             ensure_tag "${PACKAGE_IMAGE}" provider-runpod "${PACKAGE_DIGEST}" "${tag}"
           done
-          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
+          release_json="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag or (.draft == true and .name == $tag))) | if length == 1 then .[0] else error("expected exactly one release for tag or named draft") end')"
           jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
-            .tag_name == $tag and .name == $tag and .body == $body and
+            .name == $tag and .body == $body and
             .author.login == "github-actions[bot]" and .author.type == "Bot" and
             .draft == true and .prerelease == false and (.immutable // false) == false
           ' <<<"${release_json}" >/dev/null
           actual="$(jq -r '.assets[].name' <<<"${release_json}" | LC_ALL=C sort)"
           test "${actual}" = "${expected}"
           test "$(asset_digest_snapshot "${release_json}")" = "${asset_snapshot}"
-          gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          release_lookup_tag="$(jq -er '.tag_name | select(type == "string" and length > 0)' <<<"${release_json}")"
+          gh release edit "${release_lookup_tag}" --tag "${GITHUB_REF_NAME}" --verify-tag --draft=false --latest
           published="$(gh api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -ce --arg tag "${GITHUB_REF_NAME}" 'map(select(.tag_name == $tag)) | if length == 1 then .[0] else error("expected exactly one release for tag") end')"
           jq -e --arg tag "${GITHUB_REF_NAME}" --arg body "${canonical_body}" '
             .tag_name == $tag and .name == $tag and .body == $body and
