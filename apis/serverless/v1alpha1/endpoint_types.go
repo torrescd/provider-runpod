@@ -64,6 +64,7 @@ type EndpointParameters struct {
 	// DataCenterIDs limits placement to approved data centers.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=63
 	DataCenterIDs []string `json:"dataCenterIds"`
 
 	// WorkersMin is exactly one. The secured route cannot safely admit the

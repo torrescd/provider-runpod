@@ -75,6 +75,7 @@ spec:
                   dataCenterIds:
                     description: DataCenterIDs limits placement to approved data centers.
                     items:
+                      maxLength: 63
                       type: string
                     maxItems: 16
                     minItems: 1
