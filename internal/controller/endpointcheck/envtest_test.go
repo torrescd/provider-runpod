@@ -129,6 +129,20 @@ func TestEnvtestAdmissionAndEndpointCheckController(t *testing.T) {
 		if err := kube.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
 			t.Fatalf("create namespace %q: %v", namespace, err)
 		}
+		template := validEnvtestTemplate(namespace)
+		if err := kube.Create(context.Background(), template); err != nil {
+			t.Fatalf("create managed Template in %s: %v", namespace, err)
+		}
+		meta.SetExternalName(template, "template_1")
+		if err := kube.Update(context.Background(), template); err != nil {
+			t.Fatalf("publish managed Template external ID in %s: %v", namespace, err)
+		}
+		template.Status.ObservedGeneration = template.Generation
+		template.Status.AtProvider.ID = "template_1"
+		template.Status.SetConditions(xpv2.Available(), xpv2.ReconcileSuccess())
+		if err := kube.Status().Update(context.Background(), template); err != nil {
+			t.Fatalf("publish managed Template status in %s: %v", namespace, err)
+		}
 	}
 
 	t.Run("generated CRDs enforce security and lifetime constraints", func(t *testing.T) {
@@ -293,6 +307,14 @@ func TestEnvtestAdmissionAndEndpointCheckController(t *testing.T) {
 			}
 			endpoint.Status.ObservedGeneration = endpoint.Generation
 			endpoint.Status.AtProvider.ID = "endpoint_1"
+			template := &serverlessv1alpha1.Template{}
+			if err := kube.Get(context.Background(), types.NamespacedName{Name: "template", Namespace: namespace}, template); err != nil {
+				t.Fatalf("get managed Template in %s: %v", namespace, err)
+			}
+			endpoint.Status.AtProvider.TemplateID = "template_1"
+			endpoint.Status.AtProvider.TemplateResourceUID = string(template.UID)
+			endpoint.Status.AtProvider.TemplateResourceGeneration = template.Generation
+			endpoint.Status.AtProvider.TemplateImageDigest = template.Spec.ForProvider.ImageName
 			endpoint.Status.AtProvider.Version = envtestInt32(1)
 			endpoint.Status.AtProvider.FlashBootDisabled = true
 			endpoint.Status.AtProvider.FlashBootEvidenceVersion = envtestInt32(1)
@@ -389,6 +411,19 @@ func validEnvtestEndpoint(name, namespace string) *serverlessv1alpha1.Endpoint {
 			ScalerType:                   "QUEUE_DELAY",
 			ScalerValue:                  1,
 			ExecutionTimeoutMS:           1000,
+		}},
+	}
+}
+
+func validEnvtestTemplate(namespace string) *serverlessv1alpha1.Template {
+	return &serverlessv1alpha1.Template{
+		ObjectMeta: metav1.ObjectMeta{Name: "template", Namespace: namespace},
+		Spec: serverlessv1alpha1.TemplateSpec{ForProvider: serverlessv1alpha1.TemplateParameters{
+			MaxLifetimeSeconds: 3600,
+			Name:               "template",
+			ImageName:          "ghcr.io/example/model@sha256:" + strings.Repeat("a", 64),
+			Ports:              []string{"8000/http"},
+			VolumeInGB:         0,
 		}},
 	}
 }
