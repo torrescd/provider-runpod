@@ -9,6 +9,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
+	xperrors "github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -26,6 +28,19 @@ const cleanupPoll = 2 * time.Second
 // janitor delete the referenced Template. This prevents RunPod template
 // deletion from racing ahead of endpoint deletion.
 const lifetimeFinalizer = "janitor.runpod.crossplane.io/lifetime"
+
+var setupController = Setup
+
+// SetupGated defers all Endpoint and EndpointCheck watches until both CRDs are
+// established. This preserves the provider package's safe-start contract.
+func SetupGated(mgr ctrl.Manager, o controller.Options) error {
+	o.Gate.Register(func() {
+		if err := setupController(mgr); err != nil {
+			panic(xperrors.Wrap(err, "cannot setup Endpoint lifetime janitor"))
+		}
+	}, serverlessv1alpha1.EndpointGroupVersionKind, verificationv1alpha1.EndpointCheckGroupVersionKind)
+	return nil
+}
 
 func Setup(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).

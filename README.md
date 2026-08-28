@@ -28,15 +28,21 @@ implemented.
 - The production inference URL is fixed at `https://api.runpod.ai`.
 - Both clients honor `HTTP_PROXY`/`HTTPS_PROXY`; only loopback URLs may be
   substituted in tests.
-- A namespaced ProviderConfig can only use a management Secret in its namespace.
-- EndpointCheck uses a distinct local, endpoint-scoped inference Secret and
-  rejects a Secret referenced by any ProviderConfig.
-- model-router has no ProviderConfig RBAC and never holds the management key.
-- Template images must be `repository@sha256:<64 lowercase hex>` and should also
-  be verified by admission policy before resource creation.
+- Every credential Secret needs the exact
+  `runpod.crossplane.io/credential-purpose` label; the provider accepts only
+  `management` and model-router accepts only `inference`.
+- The provider and model-router are separate processes and service accounts.
+  The shipped RBAC keeps the management Secret in `crossplane-system` and the
+  inference Secret in `runpod-system`, each restricted by `resourceNames`.
+- EndpointCheck reconciliation runs inside model-router's namespace-scoped
+  manager. model-router has no ProviderConfig RBAC and never holds the
+  management key.
+- Template images must be `repository@sha256:<64 lowercase hex>` and must pass
+  the shipped fail-closed signature, SLSA provenance, and SPDX admission
+  contract before resource creation.
 - Endpoint and route lifetimes are hard-bounded to 24 hours.
 
-See [security](docs/security.md), [API sources](docs/api-sources.md), the
+See [security](docs/security.md), [RBAC](docs/rbac.md), [API sources](docs/api-sources.md), the
 [Terraform migration guide](docs/terraform-migration.md), and the
 [operations runbook](docs/runbooks.md).
 

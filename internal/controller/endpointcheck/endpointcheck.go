@@ -9,8 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
-	xperrors "github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -21,8 +19,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	serverlessv1alpha1 "github.com/torrescd/provider-runpod/apis/serverless/v1alpha1"
-	apisv1alpha1 "github.com/torrescd/provider-runpod/apis/v1alpha1"
 	verificationv1alpha1 "github.com/torrescd/provider-runpod/apis/verification/v1alpha1"
+	"github.com/torrescd/provider-runpod/internal/credentials"
 	"github.com/torrescd/provider-runpod/internal/inference"
 )
 
@@ -40,24 +38,20 @@ var newVerifier = func(endpointID string, token []byte, timeout time.Duration) (
 	return inference.New(endpointID, token, timeout)
 }
 
-func SetupGated(mgr ctrl.Manager, o controller.Options) error {
-	o.Gate.Register(func() {
-		if err := Setup(mgr); err != nil {
-			panic(xperrors.Wrap(err, "cannot setup EndpointCheck controller"))
-		}
-	}, verificationv1alpha1.EndpointCheckGroupVersionKind)
-	return nil
-}
-
+// Setup adds the EndpointCheck controller to model-router's namespace-scoped
+// manager. Secret and Endpoint reads use the direct API reader, never its cache.
 func Setup(mgr ctrl.Manager) error {
-	r := &reconciler{kube: mgr.GetClient()}
+	r := &reconciler{kube: mgr.GetClient(), reader: mgr.GetAPIReader()}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("endpointcheck.verification.runpod.crossplane.io").
 		For(&verificationv1alpha1.EndpointCheck{}).
 		Complete(r)
 }
 
-type reconciler struct{ kube client.Client }
+type reconciler struct {
+	kube   client.Client
+	reader client.Reader
+}
 
 func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	check := &verificationv1alpha1.EndpointCheck{}
@@ -85,12 +79,12 @@ func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.fail(ctx, check, inference.Result{}, err)
 	}
 	ref := check.Spec.ForProvider.InferenceCredentialsSecretRef
-	if err := r.rejectManagementSecret(ctx, check.Namespace, ref.Name); err != nil {
-		return r.fail(ctx, check, inference.Result{}, err)
-	}
 	secret := &corev1.Secret{}
-	if err := r.kube.Get(ctx, types.NamespacedName{Namespace: check.Namespace, Name: ref.Name}, secret); err != nil {
+	if err := r.reader.Get(ctx, types.NamespacedName{Namespace: check.Namespace, Name: ref.Name}, secret); err != nil {
 		return r.fail(ctx, check, inference.Result{}, errors.New("cannot read inference credential Secret"))
+	}
+	if err := credentials.RequirePurpose(secret, credentials.PurposeInference); err != nil {
+		return r.fail(ctx, check, inference.Result{}, err)
 	}
 	token, ok := secret.Data[ref.Key]
 	if !ok {
@@ -129,11 +123,11 @@ func (r *reconciler) resolveEndpoint(ctx context.Context, check *verificationv1a
 		return "", errors.New("endpointId and endpointIdRef are mutually exclusive")
 	}
 	ep := &serverlessv1alpha1.Endpoint{}
-	if err := r.kube.Get(ctx, types.NamespacedName{Namespace: check.Namespace, Name: p.EndpointIDRef.Name}, ep); err != nil {
+	if err := r.reader.Get(ctx, types.NamespacedName{Namespace: check.Namespace, Name: p.EndpointIDRef.Name}, ep); err != nil {
 		return "", errors.New("cannot resolve referenced Endpoint")
 	}
-	if !ep.DeletionTimestamp.IsZero() || ep.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue {
-		return "", errors.New("referenced Endpoint is not Ready")
+	if !ep.DeletionTimestamp.IsZero() || ep.Status.ObservedGeneration != ep.Generation || ep.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue {
+		return "", errors.New("referenced Endpoint is not Ready for its current generation")
 	}
 	id := meta.GetExternalName(ep)
 	if id == "" {
@@ -142,34 +136,11 @@ func (r *reconciler) resolveEndpoint(ctx context.Context, check *verificationv1a
 	return id, nil
 }
 
-func (r *reconciler) rejectManagementSecret(ctx context.Context, namespace, name string) error {
-	pcs := &apisv1alpha1.ProviderConfigList{}
-	if err := r.kube.List(ctx, pcs, client.InNamespace(namespace)); err != nil {
-		return errors.New("cannot enforce inference/management credential separation")
-	}
-	for i := range pcs.Items {
-		ref := pcs.Items[i].Spec.Credentials.SecretRef
-		if ref != nil && ref.Name == name && ref.Namespace == namespace {
-			return errors.New("inference credential Secret must not be a management credential Secret")
-		}
-	}
-	cpcs := &apisv1alpha1.ClusterProviderConfigList{}
-	if err := r.kube.List(ctx, cpcs); err != nil {
-		return errors.New("cannot enforce inference/management credential separation")
-	}
-	for i := range cpcs.Items {
-		ref := cpcs.Items[i].Spec.Credentials.SecretRef
-		if ref != nil && ref.Name == name && ref.Namespace == namespace {
-			return errors.New("inference credential Secret must not be a management credential Secret")
-		}
-	}
-	return nil
-}
-
 func (r *reconciler) fail(ctx context.Context, check *verificationv1alpha1.EndpointCheck, result inference.Result, cause error) (ctrl.Result, error) {
 	check.Status.AtProvider = observation(check.Spec.ForProvider.EndpointID, result, "")
 	check.Status.ObservedGeneration = check.Generation
-	check.Status.SetConditions(xpv2.Unavailable().WithMessage(safeMessage(cause)), xpv2.ReconcileError(cause))
+	safeCause := errors.New(safeMessage(cause))
+	check.Status.SetConditions(xpv2.Unavailable().WithMessage(safeCause.Error()), xpv2.ReconcileError(safeCause))
 	if err := r.kube.Status().Update(ctx, check); err != nil {
 		return ctrl.Result{}, err
 	}

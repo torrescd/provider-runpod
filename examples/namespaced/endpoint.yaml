@@ -5,7 +5,7 @@ metadata:
   namespace: runpod-system
 spec:
   providerConfigRef:
-    kind: ProviderConfig
+    kind: ClusterProviderConfig
     name: restricted-management
   forProvider:
     maxLifetimeSeconds: 14400

@@ -14,4 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package controller registers management-plane controllers for the provider
+// binary. EndpointCheck is intentionally registered by cmd/model-router so the
+// provider process never reads inference credentials.
 package controller

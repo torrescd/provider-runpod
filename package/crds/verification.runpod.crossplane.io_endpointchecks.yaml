@@ -105,8 +105,9 @@ spec:
                     type: string
                   inferenceCredentialsSecretRef:
                     description: |-
-                      InferenceCredentialsSecretRef contains an endpoint-scoped token. It must
-                      never reference the management-key Secret used by ProviderConfig.
+                      InferenceCredentialsSecretRef contains an endpoint-scoped token. The
+                      referenced Secret must be labelled
+                      runpod.crossplane.io/credential-purpose=inference.
                     properties:
                       key:
                         type: string

@@ -1,12 +1,11 @@
 apiVersion: runpod.crossplane.io/v1alpha1
-kind: ProviderConfig
+kind: ClusterProviderConfig
 metadata:
   name: restricted-management
-  namespace: runpod-system
 spec:
   credentials:
     source: Secret
     secretRef:
-      namespace: runpod-system
+      namespace: runpod-credentials
       name: runpod-management
       key: apiKey

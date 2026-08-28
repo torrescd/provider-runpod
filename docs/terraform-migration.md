@@ -13,7 +13,9 @@ Imperative actions and data-source-style queries are intentionally excluded.
 
 `EndpointCheck` is a new security/readiness resource with no Terraform
 equivalent. It performs authenticated health, exact model identity, and tool-call
-checks before routing.
+checks before routing. Its controller runs in the separate model-router process,
+not in the management provider process, and accepts only an
+inference-purpose-labelled Secret.
 
 ## Template migration and adoption
 
@@ -31,6 +33,12 @@ The first Observe reads the object by ID. A 404 means absent. Status reports the
 external ID, observed image, Serverless flag, and last observation time. Secret
 environment fields and registry credentials are not supported in v0.1 and
 never appear in status.
+
+New external Template names receive a Kubernetes-UID suffix, just like
+Endpoints. This makes post-timeout exact-name recovery specific to the CR and
+prevents an ambiguous create from adopting a pre-existing same-name,
+same-shape Template. The provider truncates the declared name as needed to stay
+within RunPod's 191-character limit.
 
 Updates PATCH only documented supported fields. `isServerless=true` and
 `isPublic=false` are enforced. Deletion is idempotent; 404 is success. Delete

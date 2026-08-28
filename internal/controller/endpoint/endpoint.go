@@ -46,7 +46,9 @@ func SetupGated(mgr ctrl.Manager, o controller.Options) error {
 		if err := Setup(mgr, o); err != nil {
 			panic(xperrors.Wrap(err, "cannot setup Endpoint controller"))
 		}
-	}, serverlessv1alpha1.EndpointGroupVersionKind)
+	}, serverlessv1alpha1.EndpointGroupVersionKind,
+		serverlessv1alpha1.TemplateGroupVersionKind,
+		verificationv1alpha1.EndpointCheckGroupVersionKind)
 	return nil
 }
 
@@ -54,8 +56,9 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := managed.ControllerName(serverlessv1alpha1.EndpointGroupKind)
 	opts := []managed.ReconcilerOption{
 		managed.WithTypedExternalConnector[*serverlessv1alpha1.Endpoint](&connector{
-			kube:  mgr.GetClient(),
-			usage: resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
+			kube:   mgr.GetClient(),
+			reader: mgr.GetAPIReader(),
+			usage:  resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
 		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
@@ -86,12 +89,13 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 }
 
 type connector struct {
-	kube  client.Client
-	usage *resource.ProviderConfigUsageTracker
+	kube   client.Client
+	reader client.Reader
+	usage  *resource.ProviderConfigUsageTracker
 }
 
 func (c *connector) Connect(ctx context.Context, cr *serverlessv1alpha1.Endpoint) (managed.TypedExternalClient[*serverlessv1alpha1.Endpoint], error) {
-	svc, err := management.Connect(ctx, c.kube, c.usage, cr)
+	svc, err := management.Connect(ctx, c.reader, c.usage, cr)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +187,12 @@ func (e *external) Delete(ctx context.Context, cr *serverlessv1alpha1.Endpoint) 
 func (e *external) Disconnect(context.Context) error { return nil }
 
 func resolveTemplateID(ctx context.Context, kube client.Client, cr *serverlessv1alpha1.Endpoint) (string, error) {
+	// A terminating Endpoint must be able to reach ExternalDelete even when its
+	// referenced Template was deleted first or is no longer Ready. Deletion only
+	// needs the RunPod endpoint external name and authenticated service client.
+	if !cr.DeletionTimestamp.IsZero() {
+		return "", nil
+	}
 	p := cr.Spec.ForProvider
 	if p.TemplateIDRef == nil {
 		if p.TemplateID == "" {
@@ -197,8 +207,8 @@ func resolveTemplateID(ctx context.Context, kube client.Client, cr *serverlessv1
 	if err := kube.Get(ctx, types.NamespacedName{Name: p.TemplateIDRef.Name, Namespace: cr.Namespace}, t); err != nil {
 		return "", err
 	}
-	if !t.DeletionTimestamp.IsZero() || t.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue {
-		return "", errors.New("referenced Template is not Ready")
+	if !t.DeletionTimestamp.IsZero() || t.Status.ObservedGeneration != t.Generation || t.Status.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue {
+		return "", errors.New("referenced Template is not Ready for its current generation")
 	}
 	id := meta.GetExternalName(t)
 	if id == "" {

@@ -1,0 +1,283 @@
+name: Bootstrap GHCR Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GO_VERSION: 1.25.13
+  CROSSPLANE_CLI_VERSION: v2.5.0
+  CROSSPLANE_CLI_SHA256: 065dd6b40c9ea5fc71e49900d5c924cc0bec7f58375922ddbde6b402f292347e
+  BUILDX_VERSION: v0.36.1
+  BUILDKIT_IMAGE: docker.io/moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+  QEMU_IMAGE: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  TRIVY_VERSION: v0.74.0
+  TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+  CONTROLLER_IMAGE: ghcr.io/torrescd/provider-runpod-controller
+  ROUTER_IMAGE: ghcr.io/torrescd/provider-runpod-model-router
+  PACKAGE_IMAGE: ghcr.io/torrescd/provider-runpod
+  BOOTSTRAP_DIR: dist/bootstrap
+  BOOTSTRAP_VERSION: v0.0.0-bootstrap.${{ github.sha }}
+
+jobs:
+  publish-candidates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main exactly
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Require untagged main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = refs/heads/main
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          if git rev-parse --verify --quiet refs/tags/v0.1.0 >/dev/null; then
+            echo "v0.1.0 already exists; package bootstrap is only a pre-release visibility step" >&2
+            exit 1
+          fi
+          test -z "$(git status --porcelain)"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Test and build both architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+          for arch in amd64 arm64; do
+            mkdir -p "bin/linux_${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w -X github.com/torrescd/provider-runpod/internal/version.Version=${BOOTSTRAP_VERSION}" -o "bin/linux_${arch}/provider" ./cmd/provider
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags="-s -w" -o "bin/linux_${arch}/model-router" ./cmd/model-router
+          done
+
+      - name: Set up pinned QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: ${{ env.QEMU_IMAGE }}
+          platforms: arm64
+
+      - name: Set up pinned Buildx and BuildKit
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Install checksum-verified Crossplane CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/provider-runpod-tools"
+          mkdir -p "${install_dir}"
+          cli="${install_dir}/crossplane"
+          curl --fail --silent --show-error --location --retry 3 --output "${cli}" \
+            "https://cli.crossplane.io/stable/${CROSSPLANE_CLI_VERSION}/bin/linux_amd64/crossplane"
+          printf '%s  %s\n' "${CROSSPLANE_CLI_SHA256}" "${cli}" | sha256sum --check --strict
+          chmod 0755 "${cli}"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+          "${cli}" version --client
+
+      - name: Build local provider packages and router archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash hack/release/build-xpkgs.sh "${BOOTSTRAP_VERSION}" "${BOOTSTRAP_DIR}"
+          for arch in amd64 arm64; do
+            docker buildx build \
+              --file cluster/images/model-router/Dockerfile \
+              --platform "linux/${arch}" \
+              --provenance=false \
+              --sbom=false \
+              --output "type=docker,dest=${BOOTSTRAP_DIR}/model-router-linux-${arch}.tar" \
+              .
+          done
+
+      - name: Install checksum-verified Trivy
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/trivy.tar.gz"
+          install_dir="${RUNNER_TEMP}/trivy"
+          mkdir -p "${install_dir}"
+          curl --fail --silent --show-error --location --retry 3 --output "${archive}" \
+            "https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}/trivy_${TRIVY_VERSION#v}_Linux-64bit.tar.gz"
+          printf '%s  %s\n' "${TRIVY_SHA256}" "${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${install_dir}" trivy
+          chmod 0755 "${install_dir}/trivy"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+          "${install_dir}/trivy" --version
+
+      - name: Scan provider runtime linux-amd64 before publishing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          input: ${{ env.BOOTSTRAP_DIR }}/provider-runtime-linux-amd64.tar
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-bootstrap-provider-linux-amd64.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Scan provider runtime linux-arm64 before publishing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          input: ${{ env.BOOTSTRAP_DIR }}/provider-runtime-linux-arm64.tar
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-bootstrap-provider-linux-arm64.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Scan model-router linux-amd64 before publishing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          input: ${{ env.BOOTSTRAP_DIR }}/model-router-linux-amd64.tar
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-bootstrap-model-router-linux-amd64.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Scan model-router linux-arm64 before publishing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          input: ${{ env.BOOTSTRAP_DIR }}/model-router-linux-arm64.tar
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-bootstrap-model-router-linux-arm64.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Scan provider package linux-amd64 before publishing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          input: ${{ env.BOOTSTRAP_DIR }}/provider-runpod-${{ env.BOOTSTRAP_VERSION }}-linux-amd64.xpkg
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-bootstrap-package-linux-amd64.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Scan provider package linux-arm64 before publishing
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # v0.33.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          skip-setup-trivy: true
+          input: ${{ env.BOOTSTRAP_DIR }}/provider-runpod-${{ env.BOOTSTRAP_VERSION }}-linux-arm64.xpkg
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-bootstrap-package-linux-arm64.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Upload bootstrap scan evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-bootstrap-scans-${{ github.sha }}
+          path: trivy-bootstrap-*.sarif
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish scanned controller candidate
+        id: controller
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: cluster/images/provider-runpod/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.CONTROLLER_IMAGE }}:${{ env.BOOTSTRAP_VERSION }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.BOOTSTRAP_VERSION }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Publish scanned model-router candidate
+        id: router
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: cluster/images/model-router/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.ROUTER_IMAGE }}:${{ env.BOOTSTRAP_VERSION }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.BOOTSTRAP_VERSION }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Publish scanned provider package candidate
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="${BOOTSTRAP_VERSION}"
+          crossplane xpkg push --package-files \
+            "${BOOTSTRAP_DIR}/provider-runpod-${BOOTSTRAP_VERSION}-linux-amd64.xpkg,${BOOTSTRAP_DIR}/provider-runpod-${BOOTSTRAP_VERSION}-linux-arm64.xpkg" \
+            "${PACKAGE_IMAGE}:${candidate}"
+          digest="$(docker buildx imagetools inspect "${PACKAGE_IMAGE}:${candidate}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record visibility bootstrap result
+        shell: bash
+        env:
+          CONTROLLER_DIGEST: ${{ steps.controller.outputs.digest }}
+          ROUTER_DIGEST: ${{ steps.router.outputs.digest }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo '### GHCR package bootstrap'
+            echo
+            echo 'These unsigned, scanned candidates exist only to create the three GHCR package records.'
+            echo 'Set each package to Public in the GitHub package settings UI, then verify anonymous access before creating v0.1.0.'
+            echo
+            echo "- ${PACKAGE_IMAGE}@${PACKAGE_DIGEST}"
+            echo "- ${CONTROLLER_IMAGE}@${CONTROLLER_DIGEST}"
+            echo "- ${ROUTER_IMAGE}@${ROUTER_DIGEST}"
+          } >> "${GITHUB_STEP_SUMMARY}"

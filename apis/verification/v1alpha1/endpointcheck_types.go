@@ -41,8 +41,9 @@ type EndpointCheckParameters struct {
 	// +kubebuilder:validation:MaxLength=512
 	ExpectedModelID string `json:"expectedModelId"`
 
-	// InferenceCredentialsSecretRef contains an endpoint-scoped token. It must
-	// never reference the management-key Secret used by ProviderConfig.
+	// InferenceCredentialsSecretRef contains an endpoint-scoped token. The
+	// referenced Secret must be labelled
+	// runpod.crossplane.io/credential-purpose=inference.
 	InferenceCredentialsSecretRef xpv2.LocalSecretKeySelector `json:"inferenceCredentialsSecretRef"`
 
 	// TimeoutSeconds bounds each probe request.

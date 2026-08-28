@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/gate"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,6 +22,33 @@ import (
 	serverlessv1alpha1 "github.com/torrescd/provider-runpod/apis/serverless/v1alpha1"
 	verificationv1alpha1 "github.com/torrescd/provider-runpod/apis/verification/v1alpha1"
 )
+
+func TestSetupGatedWaitsForBothRequiredCRDs(t *testing.T) {
+	original := setupController
+	defer func() { setupController = original }()
+	called := make(chan struct{})
+	setupController = func(ctrl.Manager) error {
+		close(called)
+		return nil
+	}
+
+	g := new(gate.Gate[schema.GroupVersionKind])
+	if err := SetupGated(nil, controller.Options{Gate: g}); err != nil {
+		t.Fatal(err)
+	}
+	g.Set(serverlessv1alpha1.EndpointGroupVersionKind, true)
+	select {
+	case <-called:
+		t.Fatal("janitor started before EndpointCheck CRD was established")
+	case <-time.After(20 * time.Millisecond):
+	}
+	g.Set(verificationv1alpha1.EndpointCheckGroupVersionKind, true)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("janitor did not start after both CRDs were established")
+	}
+}
 
 func TestExpiredEndpointWithdrawsChecksBeforeDeletingInfrastructure(t *testing.T) {
 	scheme := runtime.NewScheme()

@@ -11,16 +11,20 @@ import (
 	"errors"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	apisv1alpha1 "github.com/torrescd/provider-runpod/apis/v1alpha1"
 	clientrunpod "github.com/torrescd/provider-runpod/internal/client/runpod"
+	"github.com/torrescd/provider-runpod/internal/credentials"
 )
 
 // Connect returns an authenticated client after recording ProviderConfig use.
 // Namespaced ProviderConfigs may only read a Secret in their own namespace.
-func Connect(ctx context.Context, kube client.Client, usage *resource.ProviderConfigUsageTracker, cr resource.ModernManaged) (*clientrunpod.Client, error) {
+// kube should be the manager API reader so credential reads bypass caches.
+func Connect(ctx context.Context, kube client.Reader, usage *resource.ProviderConfigUsageTracker, cr resource.ModernManaged) (*clientrunpod.Client, error) {
 	if err := usage.Track(ctx, cr); err != nil {
 		return nil, err
 	}
@@ -50,9 +54,27 @@ func Connect(ctx context.Context, kube client.Client, usage *resource.ProviderCo
 		return nil, errors.New("unsupported providerConfigRef kind")
 	}
 
-	data, err := resource.CommonCredentialExtractor(ctx, cd.Source, kube, cd.CommonCredentialSelectors)
+	data, err := loadCredential(ctx, kube, cd)
 	if err != nil {
 		return nil, err
 	}
 	return clientrunpod.New(data)
+}
+
+func loadCredential(ctx context.Context, kube client.Reader, cd apisv1alpha1.ProviderCredentials) ([]byte, error) {
+	if cd.Source != xpv2.CredentialsSourceSecret || cd.SecretRef == nil {
+		return nil, errors.New("ProviderConfig credentials must use a Secret")
+	}
+	secret := &corev1.Secret{}
+	if err := kube.Get(ctx, types.NamespacedName{Namespace: cd.SecretRef.Namespace, Name: cd.SecretRef.Name}, secret); err != nil {
+		return nil, errors.New("cannot read management credential Secret")
+	}
+	if err := credentials.RequirePurpose(secret, credentials.PurposeManagement); err != nil {
+		return nil, err
+	}
+	data, ok := secret.Data[cd.SecretRef.Key]
+	if !ok {
+		return nil, errors.New("management credential Secret key is absent")
+	}
+	return append([]byte(nil), data...), nil
 }

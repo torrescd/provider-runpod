@@ -3,10 +3,22 @@
 ## Credential boundaries
 
 The provider controller holds only a restricted management key needed for
-Template and Endpoint CRUD. EndpointCheck reads a separate endpoint-scoped
-inference token. model-router has RBAC for EndpointChecks and `get` on Secrets,
-but has no access to ProviderConfig resources and never holds the management
-key.
+Template and Endpoint CRUD. EndpointCheck reconciliation does not run in that
+process; it runs beside model-router under model-router's namespace-scoped
+controller manager and reads a separate endpoint-scoped inference token.
+
+Credential Secrets require
+`runpod.crossplane.io/credential-purpose=management` or `=inference`. The
+provider rejects every purpose except `management`; EndpointCheck and the
+router reject every purpose except `inference`. The deployment examples add a
+stronger Kubernetes boundary: the provider can get only
+`runpod-credentials/runpod-management`, while model-router can get only
+`runpod-system/runpod-inference`. Both reads bypass controller caches.
+
+The provider janitor retains list/delete access to EndpointChecks to enforce
+route-before-endpoint teardown, but cannot update verification status or read
+the inference Secret. model-router has no ProviderConfig RBAC and never holds
+the management key. See [RBAC and process boundaries](rbac.md).
 
 OpenCode talks only to model-router. It sends model ID `runpod-experiment` and
 stores no RunPod token. The router rewrites that ID to the currently admitted
@@ -41,7 +53,8 @@ and allow only their respective CONNECT proxies:
 - model-router: `api.runpod.ai:443`
 
 The production base URLs are compiled in. Only a loopback override exists for
-tests.
+tests. All three token-bearing HTTP clients reject redirects, so an
+Authorization header can never follow a 3xx response to another target.
 
 The lifetime janitor holds its own Endpoint finalizer. It deletes matching
 EndpointChecks and waits for router drain acknowledgement, initiates Endpoint
@@ -56,5 +69,17 @@ Template creation rejects mutable tags. Admission must additionally verify the
 digest's Cosign identity, SPDX SBOM, provenance, and vulnerability policy.
 If verification is unavailable, RunPod resource creation must fail closed.
 
-Release workflows scan images before keyless signing and attach signed SPDX and
-SLSA attestations. Every workflow action and container base is digest/SHA pinned.
+Crossplane runs the provider from the selected platform manifest of the
+`ghcr.io/torrescd/provider-runpod` package itself. Each platform package embeds
+the corresponding provider runtime image. CI inspects the built xpkg archive to
+require the expected architecture, non-root user, and provider entrypoint; the
+release then scans and generates an SPDX SBOM from each complete xpkg archive
+before pushing, signing, and attesting the multi-platform package digest.
+
+The separately published `provider-runpod-controller` image is a signed mirror
+for audit and direct inspection; it is not the image selected by Crossplane's
+normal package runtime. The model-router remains a separate runtime image.
+
+Release workflows scan every architecture before keyless signing and attach
+signed SPDX and SLSA attestations. Every workflow action and container base is
+digest/SHA pinned.

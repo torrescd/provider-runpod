@@ -63,7 +63,8 @@ func New(rawKey []byte, opts ...Option) (*Client, error) {
 	c := &Client{
 		baseURL: u,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:       30 * time.Second,
+			CheckRedirect: rejectRedirect,
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
 				DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -91,6 +92,8 @@ func New(rawKey []byte, opts ...Option) (*Client, error) {
 	}
 	return c, nil
 }
+
+func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // WithHTTPClient replaces the HTTP client, primarily for deterministic tests.
 func WithHTTPClient(h *http.Client) Option {

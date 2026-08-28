@@ -27,6 +27,7 @@ import (
 
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	verificationv1alpha1 "github.com/torrescd/provider-runpod/apis/verification/v1alpha1"
+	"github.com/torrescd/provider-runpod/internal/credentials"
 )
 
 const (
@@ -36,7 +37,10 @@ const (
 	maxVerificationAge   = 90 * time.Second
 )
 
-var secretPattern = regexp.MustCompile(`(?i)rpa_[a-z0-9_-]{8,}`)
+// credentialPattern catches common high-signal credentials before a request can
+// leave the cluster. It is intentionally paired with structured key-name
+// rejection below; neither mechanism attempts to transform or log the value.
+var credentialPattern = regexp.MustCompile(`(?i)(rpa_[a-z0-9_-]{8,}|github_pat_[a-z0-9_]{20,}|gh[pousr]_[a-z0-9_]{20,}|glpat-[a-z0-9_-]{20,}|akia[a-z0-9]{16}|-----begin (rsa |ec |openssh )?private key-----|eyj[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}\.[a-z0-9_-]{10,})`)
 
 type route struct {
 	namespace       string
@@ -50,6 +54,7 @@ type Option func(*Router) error
 
 type Router struct {
 	kube         client.Client
+	reader       client.Reader
 	namespace    string
 	upstreamBase *url.URL
 	httpClient   *http.Client
@@ -66,8 +71,8 @@ func New(kube client.Client, namespace string, opts ...Option) (*Router, error) 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = http.ProxyFromEnvironment
 	r := &Router{
-		kube: kube, namespace: namespace, upstreamBase: u,
-		httpClient: &http.Client{Transport: transport, Timeout: 10 * time.Minute},
+		kube: kube, reader: kube, namespace: namespace, upstreamBase: u,
+		httpClient: &http.Client{Transport: transport, Timeout: 10 * time.Minute, CheckRedirect: rejectRedirect},
 		stateError: "no admitted EndpointCheck",
 	}
 	for _, o := range opts {
@@ -76,6 +81,19 @@ func New(kube client.Client, namespace string, opts ...Option) (*Router, error) 
 		}
 	}
 	return r, nil
+}
+
+func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// WithAPIReader configures direct, uncached reads for credential Secrets.
+func WithAPIReader(reader client.Reader) Option {
+	return func(r *Router) error {
+		if reader == nil {
+			return errors.New("Kubernetes API reader is required")
+		}
+		r.reader = reader
+		return nil
+	}
 }
 
 // WithUpstreamBaseForTesting permits loopback only.
@@ -132,8 +150,12 @@ func (r *Router) Refresh(ctx context.Context) error {
 		check := eligible[0]
 		ref := check.Spec.ForProvider.InferenceCredentialsSecretRef
 		secret := &corev1.Secret{}
-		if err := r.kube.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ref.Name}, secret); err != nil {
+		if err := r.reader.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: ref.Name}, secret); err != nil {
 			stateErr = "cannot read inference credential"
+			break
+		}
+		if err := credentials.RequirePurpose(secret, credentials.PurposeInference); err != nil {
+			stateErr = "inference credential has the wrong purpose"
 			break
 		}
 		if check.Status.AtProvider.CredentialsSecretResourceVersion == "" ||
@@ -234,7 +256,7 @@ func (r *Router) proxyChat(w http.ResponseWriter, req *http.Request, active *rou
 		writeError(w, http.StatusRequestEntityTooLarge, "request body is invalid or too large")
 		return
 	}
-	if secretPattern.Match(body) {
+	if credentialPattern.Match(body) {
 		writeError(w, http.StatusBadRequest, "request contains credential-like material")
 		return
 	}
@@ -310,7 +332,10 @@ func containsSecretKey(value any) bool {
 		for key, child := range typed {
 			lower := strings.ToLower(key)
 			if strings.Contains(lower, "password") || strings.Contains(lower, "secret") ||
-				strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") || lower == "token" {
+				strings.Contains(lower, "api_key") || strings.Contains(lower, "apikey") ||
+				lower == "token" || lower == "auth" || lower == "authorization" ||
+				lower == "credential" || lower == "credentials" ||
+				strings.Contains(lower, "private_key") || strings.Contains(lower, "client_key") {
 				return true
 			}
 			if containsSecretKey(child) {

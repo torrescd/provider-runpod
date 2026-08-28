@@ -124,6 +124,31 @@ func TestProductionTransportHonorsProxyEnvironment(t *testing.T) {
 	}
 }
 
+func TestManagementCredentialNeverFollowsRedirect(t *testing.T) {
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected = true
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	c, err := New([]byte("management-key"), WithBaseURLForTesting(source.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.GetTemplate(context.Background(), "template_1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusFound {
+		t.Fatalf("redirect response=%v, want sanitized HTTP 302", err)
+	}
+	if redirected {
+		t.Fatal("management credential followed redirect to a second origin")
+	}
+}
+
 type roundTripFunc struct {
 	fn    func(*http.Request) (*http.Response, error)
 	calls int

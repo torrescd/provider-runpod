@@ -8,6 +8,7 @@ import (
 	"errors"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	xperrors "github.com/crossplane/crossplane-runtime/v2/pkg/errors"
@@ -52,8 +53,9 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := managed.ControllerName(serverlessv1alpha1.TemplateGroupKind)
 	opts := []managed.ReconcilerOption{
 		managed.WithTypedExternalConnector[*serverlessv1alpha1.Template](&connector{
-			kube:  mgr.GetClient(),
-			usage: resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
+			kube:   mgr.GetClient(),
+			reader: mgr.GetAPIReader(),
+			usage:  resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
 		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
@@ -84,12 +86,13 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 }
 
 type connector struct {
-	kube  client.Client
-	usage *resource.ProviderConfigUsageTracker
+	kube   client.Client
+	reader client.Reader
+	usage  *resource.ProviderConfigUsageTracker
 }
 
 func (c *connector) Connect(ctx context.Context, cr *serverlessv1alpha1.Template) (managed.TypedExternalClient[*serverlessv1alpha1.Template], error) {
-	svc, err := management.Connect(ctx, c.kube, c.usage, cr)
+	svc, err := management.Connect(ctx, c.reader, c.usage, cr)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +114,7 @@ func (e *external) Observe(ctx context.Context, cr *serverlessv1alpha1.Template)
 		return managed.ExternalObservation{}, err
 	}
 	setObservation(cr, got)
-	upToDate := templateUpToDate(cr.Spec.ForProvider, got)
+	upToDate := templateMatchesInput(templateInput(cr), got)
 	if upToDate {
 		cr.Status.SetConditions(xpv2.Available())
 	}
@@ -123,7 +126,7 @@ func (e *external) Create(ctx context.Context, cr *serverlessv1alpha1.Template) 
 	if !digestImage.MatchString(cr.Spec.ForProvider.ImageName) {
 		return managed.ExternalCreation{}, errors.New("imageName must be pinned to a lowercase sha256 OCI digest")
 	}
-	desired := templateInput(cr.Spec.ForProvider)
+	desired := templateInput(cr)
 	got, err := e.service.CreateTemplate(ctx, desired)
 	if errors.Is(err, clientrunpod.ErrCreateAmbiguous) {
 		got, err = e.service.FindTemplateByName(ctx, desired.Name)
@@ -143,7 +146,7 @@ func (e *external) Update(ctx context.Context, cr *serverlessv1alpha1.Template) 
 	if !digestImage.MatchString(cr.Spec.ForProvider.ImageName) {
 		return managed.ExternalUpdate{}, errors.New("imageName must be pinned to a lowercase sha256 OCI digest")
 	}
-	got, err := e.service.UpdateTemplate(ctx, meta.GetExternalName(cr), templateInput(cr.Spec.ForProvider))
+	got, err := e.service.UpdateTemplate(ctx, meta.GetExternalName(cr), templateInput(cr))
 	if err != nil {
 		return managed.ExternalUpdate{}, err
 	}
@@ -162,17 +165,27 @@ func (e *external) Delete(ctx context.Context, cr *serverlessv1alpha1.Template) 
 
 func (e *external) Disconnect(context.Context) error { return nil }
 
-func templateInput(p serverlessv1alpha1.TemplateParameters) clientrunpod.TemplateInput {
+func templateInput(cr *serverlessv1alpha1.Template) clientrunpod.TemplateInput {
+	p := cr.Spec.ForProvider
 	return clientrunpod.TemplateInput{
-		Name: p.Name, ImageName: p.ImageName, IsPublic: false, IsServerless: true,
+		Name: effectiveName(cr), ImageName: p.ImageName, IsPublic: false, IsServerless: true,
 		ContainerDiskInGB: p.ContainerDiskInGB, DockerEntrypoint: p.DockerEntrypoint,
 		DockerStartCmd: p.DockerStartCmd, Ports: p.Ports, VolumeInGB: p.VolumeInGB,
 		VolumeMountPath: p.VolumeMountPath,
 	}
 }
 
-func templateUpToDate(p serverlessv1alpha1.TemplateParameters, got *clientrunpod.Template) bool {
-	return templateMatchesInput(templateInput(p), got)
+func effectiveName(cr *serverlessv1alpha1.Template) string {
+	suffix := "-xp-" + strings.ToLower(string(cr.UID))
+	if len(suffix) > 16 {
+		suffix = suffix[:16]
+	}
+	maxPrefix := 191 - len(suffix)
+	name := cr.Spec.ForProvider.Name
+	if len(name) > maxPrefix {
+		name = name[:maxPrefix]
+	}
+	return name + suffix
 }
 
 func templateMatchesInput(want clientrunpod.TemplateInput, got *clientrunpod.Template) bool {

@@ -5,6 +5,8 @@ metadata:
 spec:
   serviceAccountTemplate:
     metadata:
+      # Pre-create this exact account with examples/rbac/ when Crossplane's
+      # RBAC manager is disabled.
       name: provider-runpod
   deploymentTemplate:
     metadata:

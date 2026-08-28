@@ -13,9 +13,17 @@ metadata:
 rules:
   - apiGroups: ["verification.runpod.crossplane.io"]
     resources: ["endpointchecks"]
-    verbs: ["get", "list", "watch", "update", "patch"]
+    verbs: ["get", "list", "watch", "update", "delete"]
+  - apiGroups: ["verification.runpod.crossplane.io"]
+    resources: ["endpointchecks/status"]
+    verbs: ["update"]
+  - apiGroups: ["serverless.runpod.crossplane.io"]
+    resources: ["endpoints"]
+    resourceNames: ["opencode-model"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["secrets"]
+    resourceNames: ["runpod-inference"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -67,7 +75,10 @@ spec:
               containerPort: 8080
           readinessProbe:
             httpGet:
-              path: /readyz
+              # Kubernetes process readiness must not depend on an experiment
+              # route that is created by a later GitOps stage. Clients use
+              # /readyz for fail-closed model-route readiness.
+              path: /healthz
               port: http
             periodSeconds: 5
           livenessProbe:

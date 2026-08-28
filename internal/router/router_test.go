@@ -21,6 +21,7 @@ import (
 
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	verificationv1alpha1 "github.com/torrescd/provider-runpod/apis/verification/v1alpha1"
+	"github.com/torrescd/provider-runpod/internal/credentials"
 )
 
 func TestStableModelIsRewrittenAndCredentialIsInjected(t *testing.T) {
@@ -70,6 +71,71 @@ func TestCollisionAndInboundSecretsFailClosed(t *testing.T) {
 	r.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("credential accepted: %d", recorder.Code)
+	}
+}
+
+func TestProcessHealthDoesNotDependOnAnAdmittedRoute(t *testing.T) {
+	scheme := testScheme(t)
+	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r, err := New(kube, "runpod-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	health := httptest.NewRecorder()
+	r.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("process health without a route=%d, want 200", health.Code)
+	}
+
+	ready := httptest.NewRecorder()
+	r.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Fatalf("route readiness without a route=%d, want 503", ready.Code)
+	}
+}
+
+func TestCredentialMaterialIsRejectedBeforeProxying(t *testing.T) {
+	r := readyRouter(t, "http://127.0.0.1:1", readyCheck("one"))
+	cases := map[string]string{
+		"RunPod key":        `{"model":"runpod-experiment","messages":[{"role":"user","content":"rpa_abcdefghijk"}]}`,
+		"GitHub token":      `{"model":"runpod-experiment","messages":[{"role":"user","content":"github_pat_abcdefghijklmnopqrstuvwxyz"}]}`,
+		"AWS access key":    `{"model":"runpod-experiment","messages":[{"role":"user","content":"AKIA1234567890ABCDEF"}]}`,
+		"private key":       `{"model":"runpod-experiment","messages":[{"role":"user","content":"-----BEGIN PRIVATE KEY-----"}]}`,
+		"JWT":               `{"model":"runpod-experiment","messages":[{"role":"user","content":"eyJabcdefghijk.abcdefghijk.abcdefghijk"}]}`,
+		"structured secret": `{"model":"runpod-experiment","metadata":{"credentials":"must-not-leave"}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			r.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("credential material response=%d, want 400", recorder.Code)
+			}
+		})
+	}
+}
+
+func TestRouterCredentialNeverFollowsRedirect(t *testing.T) {
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected = true
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	r := readyRouter(t, source.URL, readyCheck("one"))
+	recorder := httptest.NewRecorder()
+	body := `{"model":"runpod-experiment","messages":[{"role":"user","content":"hello"}]}`
+	r.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	if recorder.Code != http.StatusFound {
+		t.Fatalf("redirect response=%d, want 302", recorder.Code)
+	}
+	if redirected {
+		t.Fatal("router inference credential followed redirect to a second origin")
 	}
 }
 
@@ -127,6 +193,35 @@ func TestStaleVerificationAndCredentialRotationFailClosed(t *testing.T) {
 	}
 }
 
+func TestManagementPurposeCredentialFailsClosed(t *testing.T) {
+	scheme := testScheme(t)
+	check := readyCheck("wrong-purpose")
+	secret := inferenceSecret()
+	secret.Labels[credentials.PurposeLabel] = credentials.PurposeManagement
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(check, secret).Build()
+	r, err := New(kube, "runpod-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Refresh(context.Background()); err == nil || r.snapshot() != nil {
+		t.Fatal("management-purpose credential was routed")
+	}
+}
+
+func TestRefreshUsesDirectReaderForInferenceSecret(t *testing.T) {
+	scheme := testScheme(t)
+	check := readyCheck("direct-secret")
+	cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(check).Build()
+	direct := fake.NewClientBuilder().WithScheme(scheme).WithObjects(inferenceSecret()).Build()
+	r, err := New(cached, "runpod-system", WithAPIReader(direct))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Refresh(context.Background()); err != nil || r.snapshot() == nil {
+		t.Fatalf("direct Secret reader was not used: route=%v err=%v", r.snapshot(), err)
+	}
+}
+
 func readyRouter(t *testing.T, upstream string, checks ...*verificationv1alpha1.EndpointCheck) *Router {
 	t.Helper()
 	scheme := testScheme(t)
@@ -161,7 +256,10 @@ func readyCheck(name string) *verificationv1alpha1.EndpointCheck {
 }
 
 func inferenceSecret() *corev1.Secret {
-	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "inference", Namespace: "runpod-system", ResourceVersion: "1"}, Data: map[string][]byte{"token": []byte("endpoint-token")}}
+	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "inference", Namespace: "runpod-system", ResourceVersion: "1",
+		Labels: map[string]string{credentials.PurposeLabel: credentials.PurposeInference},
+	}, Data: map[string][]byte{"token": []byte("endpoint-token")}}
 }
 
 func testScheme(t *testing.T) *runtime.Scheme {

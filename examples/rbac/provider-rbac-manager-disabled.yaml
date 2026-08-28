@@ -1,0 +1,81 @@
+# Apply this file before installing provider-runpod when the Crossplane Helm
+# value rbacManager.deploy=false. The ServiceAccount name must match the
+# DeploymentRuntimeConfig serviceAccountTemplate in examples/runtime/.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: provider-runpod
+  namespace: crossplane-system
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: provider-runpod
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["runpod.crossplane.io"]
+    resources: ["providerconfigs", "clusterproviderconfigs"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["runpod.crossplane.io"]
+    resources: ["providerconfigs/status", "clusterproviderconfigs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["runpod.crossplane.io"]
+    resources: ["providerconfigusages"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["serverless.runpod.crossplane.io"]
+    resources: ["templates", "endpoints"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["serverless.runpod.crossplane.io"]
+    resources: ["templates/status", "endpoints/status"]
+    verbs: ["get", "update", "patch"]
+  # The provider janitor sees EndpointCheck metadata/spec and deletes checks
+  # before endpoints. It has no Secret permission for inference credentials.
+  - apiGroups: ["verification.runpod.crossplane.io"]
+    resources: ["endpointchecks"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: provider-runpod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: provider-runpod
+subjects:
+  - kind: ServiceAccount
+    name: provider-runpod
+    namespace: crossplane-system
+---
+# Keep this Role in the dedicated runpod-credentials namespace and resourceNames aligned with the
+# ClusterProviderConfig SecretRef in examples/namespaced/providerconfig.yaml.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: provider-runpod-management-credential
+  namespace: runpod-credentials
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["runpod-management"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: provider-runpod-management-credential
+  namespace: runpod-credentials
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: provider-runpod-management-credential
+subjects:
+  - kind: ServiceAccount
+    name: provider-runpod
+    namespace: crossplane-system

@@ -1,6 +1,6 @@
 module github.com/torrescd/provider-runpod
 
-go 1.25.11
+go 1.25.13
 
 tool sigs.k8s.io/controller-tools/cmd/controller-gen
 

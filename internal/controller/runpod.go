@@ -22,7 +22,6 @@ import (
 
 	"github.com/torrescd/provider-runpod/internal/controller/config"
 	"github.com/torrescd/provider-runpod/internal/controller/endpoint"
-	"github.com/torrescd/provider-runpod/internal/controller/endpointcheck"
 	"github.com/torrescd/provider-runpod/internal/controller/janitor"
 	"github.com/torrescd/provider-runpod/internal/controller/template"
 )
@@ -34,14 +33,11 @@ func SetupGated(mgr ctrl.Manager, o controller.Options) error {
 		config.Setup,
 		template.SetupGated,
 		endpoint.SetupGated,
-		endpointcheck.SetupGated,
+		janitor.SetupGated,
 	} {
 		if err := setup(mgr, o); err != nil {
 			return err
 		}
-	}
-	if err := janitor.Setup(mgr); err != nil {
-		return err
 	}
 	return nil
 }

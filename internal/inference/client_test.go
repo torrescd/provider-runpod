@@ -74,3 +74,26 @@ func TestProductionTransportHonorsProxyEnvironment(t *testing.T) {
 		t.Fatal("transport has no environment proxy function")
 	}
 }
+
+func TestInferenceCredentialNeverFollowsRedirect(t *testing.T) {
+	redirected := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redirected = true
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	c, err := New("endpoint_1", []byte("inference-key"), time.Second, WithBaseURLForTesting(source.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Verify(context.Background(), "org/model"); err == nil {
+		t.Fatal("redirect was not rejected")
+	}
+	if redirected {
+		t.Fatal("inference credential followed redirect to a second origin")
+	}
+}

@@ -20,12 +20,14 @@ type fakeService struct {
 	created   int
 	createErr error
 	recovered *clientrunpod.Template
+	findName  string
 }
 
 func (f *fakeService) GetTemplate(context.Context, string) (*clientrunpod.Template, error) {
 	return nil, clientrunpod.ErrNotFound
 }
-func (f *fakeService) FindTemplateByName(context.Context, string) (*clientrunpod.Template, error) {
+func (f *fakeService) FindTemplateByName(_ context.Context, name string) (*clientrunpod.Template, error) {
+	f.findName = name
 	if f.recovered == nil {
 		return nil, clientrunpod.ErrNotFound
 	}
@@ -44,7 +46,7 @@ func (f *fakeService) UpdateTemplate(context.Context, string, clientrunpod.Templ
 func (f *fakeService) DeleteTemplate(context.Context, string) error { return clientrunpod.ErrNotFound }
 
 func TestCreateRequiresDigestAndRecoversAmbiguousResult(t *testing.T) {
-	cr := &serverlessv1alpha1.Template{ObjectMeta: metav1.ObjectMeta{Name: "model"}, Spec: serverlessv1alpha1.TemplateSpec{ForProvider: serverlessv1alpha1.TemplateParameters{Name: "model", ImageName: "registry/model:latest"}}}
+	cr := &serverlessv1alpha1.Template{ObjectMeta: metav1.ObjectMeta{Name: "model", UID: "12345678-1234-1234-1234-123456789abc"}, Spec: serverlessv1alpha1.TemplateSpec{ForProvider: serverlessv1alpha1.TemplateParameters{Name: "model", ImageName: "registry/model:latest"}}}
 	svc := &fakeService{}
 	e := &external{service: svc}
 	if _, err := e.Create(context.Background(), cr); err == nil || svc.created != 0 {
@@ -52,12 +54,15 @@ func TestCreateRequiresDigestAndRecoversAmbiguousResult(t *testing.T) {
 	}
 	cr.Spec.ForProvider.ImageName = "registry/model@sha256:" + strings.Repeat("a", 64)
 	svc.createErr = clientrunpod.ErrCreateAmbiguous
-	svc.recovered = &clientrunpod.Template{ID: "tpl_recovered", Name: "model", ImageName: cr.Spec.ForProvider.ImageName, IsServerless: true}
+	svc.recovered = &clientrunpod.Template{ID: "tpl_recovered", Name: effectiveName(cr), ImageName: cr.Spec.ForProvider.ImageName, IsServerless: true}
 	if _, err := e.Create(context.Background(), cr); err != nil {
 		t.Fatal(err)
 	}
 	if meta.GetExternalName(cr) != "tpl_recovered" {
 		t.Fatalf("external name=%q", meta.GetExternalName(cr))
+	}
+	if svc.findName != effectiveName(cr) || svc.findName == cr.Spec.ForProvider.Name {
+		t.Fatalf("ambiguous recovery name=%q is not CR-UID scoped", svc.findName)
 	}
 }
 

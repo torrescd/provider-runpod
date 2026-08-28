@@ -106,6 +106,38 @@ func TestResolveTemplateReferenceRequiresReadyTemplate(t *testing.T) {
 	}
 }
 
+func TestResolveTemplateReferenceRejectsStaleReadyGeneration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = serverlessv1alpha1.SchemeBuilder.AddToScheme(scheme)
+	template := &serverlessv1alpha1.Template{ObjectMeta: metav1.ObjectMeta{Name: "template", Namespace: "runpod-system", Generation: 2}}
+	meta.SetExternalName(template, "tpl_1")
+	template.Status.ObservedGeneration = 1
+	template.Status.SetConditions(xpv2.Available())
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(template).Build()
+	cr := endpointCR()
+	cr.Spec.ForProvider.TemplateID = ""
+	cr.Spec.ForProvider.TemplateIDRef = &xpv2.Reference{Name: template.Name}
+	if _, err := resolveTemplateID(context.Background(), kube, cr); err == nil {
+		t.Fatal("Ready condition from a stale Template generation was accepted")
+	}
+}
+
+func TestDeletingEndpointDoesNotDependOnReferencedTemplate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = serverlessv1alpha1.SchemeBuilder.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cr := endpointCR()
+	cr.Spec.ForProvider.TemplateID = ""
+	cr.Spec.ForProvider.TemplateIDRef = &xpv2.Reference{Name: "already-deleted"}
+	now := metav1.Now()
+	cr.DeletionTimestamp = &now
+
+	id, err := resolveTemplateID(context.Background(), kube, cr)
+	if err != nil || id != "" {
+		t.Fatalf("terminating Endpoint still required Template: id=%q err=%v", id, err)
+	}
+}
+
 func endpointCR() *serverlessv1alpha1.Endpoint {
 	return &serverlessv1alpha1.Endpoint{
 		ObjectMeta: metav1.ObjectMeta{Name: "endpoint", Namespace: "runpod-system", UID: "12345678-1234-1234-1234-123456789abc"},
