@@ -76,6 +76,7 @@ spec:
                     description: DataCenterIDs limits placement to approved data centers.
                     items:
                       maxLength: 63
+                      pattern: ^[A-Za-z0-9_-]+$
                       type: string
                     maxItems: 16
                     minItems: 1
@@ -210,8 +211,6 @@ spec:
                 x-kubernetes-validations:
                 - message: templateIdRef is required
                   rule: has(self.templateIdRef)
-                - message: dataCenterIds must be explicit RunPod identifiers
-                  rule: self.dataCenterIds.all(id, id.matches('^[A-Za-z0-9_-]+$'))
               managementPolicies:
                 default:
                 - '*'

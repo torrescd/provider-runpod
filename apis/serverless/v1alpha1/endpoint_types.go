@@ -26,7 +26,6 @@ var (
 // EndpointParameters are the bounded RunPod Serverless endpoint fields.
 // API source: https://docs.runpod.io/api-reference/endpoints/POST/endpoints
 // +kubebuilder:validation:XValidation:rule="has(self.templateIdRef)",message="templateIdRef is required"
-// +kubebuilder:validation:XValidation:rule="self.dataCenterIds.all(id, id.matches('^[A-Za-z0-9_-]+$'))",message="dataCenterIds must be explicit RunPod identifiers"
 type EndpointParameters struct {
 	// MaxLifetimeSeconds is the hard lifetime of this experiment endpoint.
 	// The provider janitor removes EndpointChecks first, then deletes this CR.
@@ -65,6 +64,7 @@ type EndpointParameters struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9_-]+$`
 	DataCenterIDs []string `json:"dataCenterIds"`
 
 	// WorkersMin is exactly one. The secured route cannot safely admit the
