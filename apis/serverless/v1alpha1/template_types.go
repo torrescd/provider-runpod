@@ -19,8 +19,6 @@ var (
 
 // TemplateParameters are the supported, security-bounded RunPod template fields.
 // API source: https://docs.runpod.io/api-reference/templates/POST/templates
-// +kubebuilder:validation:XValidation:rule="self.ports.all(p, p.matches('^[1-9][0-9]{0,4}/(http|tcp)$'))",message="ports must use an explicit port/protocol declaration"
-// +kubebuilder:validation:XValidation:rule="self.ports.all(p, int(p.split('/')[0]) <= 65535)",message="ports must be in the range 1..65535"
 type TemplateParameters struct {
 	// MaxLifetimeSeconds bounds this Template even when the dependent Endpoint
 	// is never admitted or created. The independent reaper direct-lists all
@@ -62,6 +60,8 @@ type TemplateParameters struct {
 	// It is required because RunPod otherwise defaults to 8888/http and 22/tcp.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=10
+	// +kubebuilder:validation:items:Pattern=`^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])/(http|tcp)$`
 	Ports []string `json:"ports"`
 
 	// VolumeInGB must be explicitly zero. RunPod otherwise defaults an omitted
