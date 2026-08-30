@@ -28,7 +28,7 @@ spec:
           containers:
             - name: package-runtime
               args:
-                - --enable-secret-cache=false
+                - --no-enable-secret-cache
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
